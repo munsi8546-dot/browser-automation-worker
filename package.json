@@ -1,0 +1,17 @@
+{
+  "name": "amin-ai-browser-automation-worker",
+  "version": "1.0.0",
+  "description": "Playwright-based browser automation worker for the Amin AI Global Opportunity Platform. Consumes the Timeline AI v1 contract (schemaVersion 1.0) and returns a screen-recording MP4.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.22.2",
+    "playwright": "^1.62.0"
+  }
+}
