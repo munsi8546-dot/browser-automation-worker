@@ -1,19 +1,18 @@
-FROM node:20-bookworm-slim
+# প্লে-রাইটের লেটেস্ট ১.৬২.০ ইমেজ ব্যবহার করছি যা প্যাকেজের সাথে পুরোপুরি মিলবে
+FROM mcr.microsoft.com/playwright:v1.62.0-jammy
 
-# ffmpeg (webm -> mp4) + Chromium-এর system libraries
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+# অ্যাপ ডিরেক্টরি তৈরি
+WORKDIR /usr/src/app
 
-WORKDIR /app
-
-COPY package.json ./
+# প্যাকেজ ফাইল কপি এবং ইনস্টল
+COPY package*.json ./
 RUN npm install
 
-# Playwright-এর Chromium + OS deps install
-RUN npx playwright install --with-deps chromium
-
+# অ্যাপের বাকি কোড কপি
 COPY . .
 
+# পোর্ট সেটআপ
 EXPOSE 10000
 
-CMD ["node", "server.js"]
+# সার্ভার চালু করার কমান্ড
+CMD [ "node", "server.js" ]
