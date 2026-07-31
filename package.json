@@ -1,7 +1,7 @@
 {
-  "name": "amin-ai-browser-automation-worker",
+  "name": "amin-ai-pdf-generator-worker",
   "version": "1.0.0",
-  "description": "Playwright-based browser automation worker for the Amin AI Global Opportunity Platform. Consumes the Timeline AI v1 contract (schemaVersion 1.0) and returns a screen-recording MP4.",
+  "description": "PDFKit-based PDF generator for the Amin AI Global Opportunity Platform's digital products (ebooks, resume templates, planners, checklists, guides). Consumes a versioned structured-content contract and returns a formatted PDF.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -11,7 +11,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "express": "^4.22.2",
-    "playwright": "^1.62.0"
+    "express": "^4.19.2",
+    "pdfkit": "^0.15.0"
   }
 }
