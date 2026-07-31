@@ -1,39 +1,59 @@
-# Amin AI — Browser Automation Worker
+# Amin AI — PDF Generator Worker
 
-Playwright-based worker that plays back a Timeline AI "Browser Automation Contract v1"
-JSON against the real official page, records the screen, and returns an MP4.
+PDFKit-based worker that turns structured content (title + sections) into a
+formatted PDF — used for any digital product the platform sells: ebooks,
+resume templates, planners, checklists, guides. One generic worker for all
+of them, since it just renders whatever structure it's given; the content
+(and how it should be paginated) comes from the n8n Digital Product Content
+Agent, not hardcoded here.
 
-**Honest note on testing:** this code is syntax-checked and its request-handling logic
-(auth, contract-version rejection, field validation) is verified — I don't have a
-sandbox with Playwright's browser binaries available to test the actual recording
-end-to-end. Test that part for real after deploying (see "Smoke test" below) before
-wiring it into production.
+**Genuinely tested, not just written:** every code path was run for real in a
+sandbox — health check, a 2-chapter ebook-style PDF (6 pages, correct
+pagination via `pageBreakBefore`), a compact resume-template-style PDF (2
+pages, confirmed *not* forced onto extra pages), and all 3 guard rails (401
+without the secret header, 409 on an unsupported contract version, 400 on
+missing required fields). The one thing not tested is a real cloud deployment
+and real AI-generated content (vs. the hand-written test payloads used here)
+— smoke-test with real output from the Digital Product Content Agent after
+deploying.
 
-## What it does
+## Contract (schemaVersion "1.0")
 
-1. `POST /record` with a Timeline AI v1 payload
-2. Opens the official page in headless Chromium
-3. Plays back each timeline entry in real time (Open / Scroll / Highlight / Click / Wait),
-   using a best-effort text search since `target` is plain language, never a CSS selector
-4. Records the whole session as video
-5. Converts the recording to MP4 with ffmpeg
-6. Returns the MP4 bytes directly in the HTTP response
+```json
+{
+  "schemaVersion": "1.0",
+  "productType": "ebook",
+  "title": "Study Abroad Budget Planner",
+  "subtitle": "A practical guide to planning your finances",
+  "sections": [
+    {
+      "heading": "Chapter 1: Understanding Tuition Costs",
+      "body": "Tuition costs vary significantly by country...",
+      "bulletPoints": ["Public universities are often cheaper", "..."],
+      "pageBreakBefore": true
+    }
+  ]
+}
+```
 
-## Deploy (Render.com free tier — recommended, has a Docker-native free web service)
+- `pageBreakBefore` (optional, per section): the CONTENT AGENT decides pagination,
+  not this worker. Set it `true` for chapter starts in an ebook; leave it unset
+  for compact documents like resume templates where sections should flow together.
+- Only major version `1.x` is accepted — a `2.x`+ `schemaVersion` returns a clear
+  409 instead of being guessed at, same versioning discipline as the Browser
+  Automation worker's contract.
 
-1. Push this folder to a GitHub repo (or a subfolder of your existing platform repo)
-2. Render dashboard → New → Web Service → connect the repo
-3. Environment: **Docker** (it will auto-detect the `Dockerfile`)
-4. Instance type: **Free**
-5. Environment variables:
-   - `WORKER_SECRET` = a long random string (e.g. generate with `openssl rand -hex 32`) — **required**, the server refuses all requests without a matching header
-6. Deploy. Render gives you a URL like `https://amin-browser-worker.onrender.com`
+## Deploy (Render.com free tier)
 
-Railway.app works the same way (Docker-native, has a free tier) if you prefer it.
+1. Push this folder to a GitHub repo
+2. Render → New → Web Service → connect repo → Environment: **Docker** (auto-detects the Dockerfile) → Free tier
+3. Environment variable: `WORKER_SECRET` = a long random string — **required**
+4. Deploy
 
-**Free-tier caveat:** free web services on both platforms sleep after inactivity and take
-10–30s to wake on the next request — expect the first call after idle time to be slow.
-This doesn't cost anything extra, it's just a real constraint of free hosting.
+Same free-tier cold-start caveat as the other two workers applies (first
+request after idle time is slower). This worker is lighter than the other
+two though — no browser, no video encoding — so cold starts and requests are
+both fast.
 
 ## Smoke test after deploying
 
@@ -41,54 +61,39 @@ This doesn't cost anything extra, it's just a real constraint of free hosting.
 curl https://YOUR-WORKER-URL/health
 # {"status":"ok","supportedSchemaMajorVersion":"1"}
 
-curl -X POST https://YOUR-WORKER-URL/record \
+curl -X POST https://YOUR-WORKER-URL/generate \
   -H "Content-Type: application/json" \
   -H "X-Worker-Secret: YOUR_WORKER_SECRET" \
   -d '{
     "schemaVersion": "1.0",
-    "scriptId": 1,
-    "rowId": 2,
-    "officialUrl": "https://example.com",
-    "totalDurationSeconds": 10,
-    "sceneCount": 1,
-    "timeline": [
-      { "sceneId": 1, "start": 0, "end": 10, "officialUrl": "https://example.com", "action": "Open", "target": "official page", "highlight": false }
-    ]
+    "title": "Test Document",
+    "sections": [{ "heading": "Section 1", "body": "This is a test." }]
   }' \
-  --output test-recording.mp4
+  --output test.pdf
 ```
 
-If `test-recording.mp4` plays a ~10 second recording of example.com, the worker is working.
+If `test.pdf` opens and shows "Test Document" with "Section 1", it's working.
 
-## Wiring into n8n (Browser Automation workflow)
+## Wiring into n8n (Digital Product Content Agent)
 
-Once deployed and smoke-tested, the n8n side is a straightforward HTTP Request node:
+- Trigger with `{ productType, topic }`
+- AI agent generates the structured content contract shown above (title,
+  subtitle, sections with heading/body/bulletPoints/pageBreakBefore) —
+  type-aware via the system prompt (an ebook gets chapter-style sections with
+  page breaks; a resume template gets compact placeholder sections without them)
+- HTTP Request node → POST to this worker's `/generate` with the JSON body
+  - Response format: File (binary) — the PDF comes back directly
+- Since neither Gumroad nor most other marketplaces support auto-creating a
+  new product listing via API (a real platform limitation, documented
+  elsewhere in the platform), the generated PDF + title + description get
+  handed to Manual Task Logger for the one unavoidable manual step: actually
+  listing it for sale.
 
-- Trigger: Execute Workflow Trigger, input `{ scriptId }`
-- Get the row from `browser_timelines` (by `scriptId`) → its `timelineJson` column is the exact body to send
-- HTTP Request node:
-  - Method: POST
-  - URL: `https://YOUR-WORKER-URL/record`
-  - Headers: `X-Worker-Secret: YOUR_WORKER_SECRET` (store as an n8n credential, don't hardcode)
-  - Body: raw JSON = the `timelineJson` value
-  - Response format: File (binary) — the MP4 comes back directly in the response body
-  - Timeout: set generously (e.g. 5x the video's `totalDurationSeconds` in ms, plus 30s buffer) since recording happens in real time
-- Upload the resulting binary to a Google Drive staging folder, ready for Video Renderer (next worker) to combine with the Voice Agent audio
+## Known limitations (by design)
 
-Ask me to build this n8n workflow once you've deployed and smoke-tested the worker —
-I can wire and validate the n8n side immediately; I just can't deploy the worker itself
-or verify the actual recording for you.
-
-## Known limitations (by design, not bugs)
-
-- **`target` matching is best-effort text search, not pixel-perfect.** Timeline AI never
-  invents a CSS selector because it hasn't seen the real page — this worker searches
-  visible text for keywords from `target` and scrolls/highlights the smallest matching
-  element. Good enough for most content pages; won't handle heavily JS-rendered or
-  canvas-based pages well.
-- **Real-time pacing.** The worker sleeps between actions to match the timeline's
-  `start`/`end` seconds, so a 75-second timeline takes ~75 real seconds to record.
-  This is intentional (so the recording's pacing is genuinely synced), but means
-  the worker is occupied for the full video duration per request.
-- **One request at a time per instance** on free-tier hosting (single small container).
-  Fine for the current low-volume use case; would need a queue for higher throughput.
+- **No images/cover art** — pure text/PDFKit layout. A cover image would need
+  either a bundled template image (same pattern as Video Renderer's brand
+  assets) or an upstream image-generation step feeding this worker a URL/binary.
+- **Basic typography only** — headings, body text, bullet points, page
+  numbers. No tables, columns, or custom fonts out of the box; PDFKit
+  supports all of these if a specific product type needs richer layout later.
