@@ -1,289 +1,106 @@
 'use strict';
 
 /**
- * Amin AI Global Opportunity Platform — Browser Automation Worker
+ * Amin AI Global Opportunity Platform — PDF Generator Worker
  *
- * Consumes the "Browser Automation Contract v1" produced by the Timeline AI
- * n8n workflow, plays it back against the real official page with Playwright,
- * records the screen, and returns the resulting MP4.
+ * Consumes a versioned "Digital Product Content Contract v1" and returns a
+ * formatted PDF. Deliberately generic across product types (ebook, resume
+ * template, planner, checklist, guide, worksheet) - it just renders whatever
+ * structure it's given; the Digital Product Content Agent (n8n) decides what
+ * content and page-break structure suits each product type.
  *
  * Contract (schemaVersion "1.0"):
  * {
  *   "schemaVersion": "1.0",
- *   "scriptId": 1,
- *   "rowId": 2,
- *   "officialUrl": "https://...",
- *   "totalDurationSeconds": 75,
- *   "sceneCount": 5,
- *   "timeline": [
- *     { "sceneId": 1, "start": 0, "end": 6, "officialUrl": "...", "action": "Open", "target": "official program page", "highlight": true },
- *     ...
+ *   "productType": "ebook",
+ *   "title": "Study Abroad Budget Planner",
+ *   "subtitle": "A practical guide to planning your finances",
+ *   "sections": [
+ *     {
+ *       "heading": "Chapter 1: Understanding Tuition Costs",
+ *       "body": "Tuition costs vary significantly by country...",
+ *       "bulletPoints": ["Public universities are often cheaper", "..."],
+ *       "pageBreakBefore": true
+ *     }
  *   ]
  * }
  *
- * VERSIONING RULE (must stay true for this worker to remain stable):
- * - This worker only understands major version "1". Any schemaVersion starting
- *   with "1." (e.g. "1.0", "1.1") is accepted - new OPTIONAL fields may appear
- *   and are simply ignored by this worker without needing a code change.
- * - A schemaVersion starting with "2." or higher is REJECTED with a clear 409
- *   error rather than guessed at. That is the signal a new worker version is
- *   needed - never silently attempt to interpret an incompatible contract.
- *
- * SECURITY: this endpoint is a public webhook once deployed. It requires a
- * shared-secret header (see WORKER_SECRET below) - set this in your hosting
- * provider's environment variables, and put the same value in n8n's HTTP
- * Request node as a header. Do not deploy without setting a real secret.
+ * VERSIONING RULE (same discipline as the Browser Automation worker's contract):
+ * only major version "1" is understood. A "2.x"+ schemaVersion is rejected
+ * with a clear 409 rather than guessed at.
  */
 
 const express = require('express');
-const { chromium } = require('playwright');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const crypto = require('crypto');
-const { spawn } = require('child_process');
+const PDFDocument = require('pdfkit');
+const { PassThrough } = require('stream');
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '5mb' }));
 
 const PORT = process.env.PORT || 8080;
 const WORKER_SECRET = process.env.WORKER_SECRET || '';
 const SUPPORTED_MAJOR_VERSION = '1';
+const MAX_SECTIONS = 60;
 
-// Viewport / recording size — vertical, matches the rest of the platform's short-form format.
-const RECORDING_WIDTH = 1080;
-const RECORDING_HEIGHT = 1920;
-
-// Safety ceiling so a bad request can't tie up the worker (and its free-tier hosting) indefinitely.
-const MAX_TOTAL_DURATION_SECONDS = 180;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Best-effort "scroll to / highlight the thing described in plain language" helper.
- * Timeline AI deliberately never invents CSS selectors (it hasn't seen the real page),
- * so `target` is a human description like "tuition section" or "Apply Now button".
- * This does a simple case-insensitive text search across visible elements and
- * scrolls the best match into view. It is intentionally approximate - if nothing
- * matches, it just scrolls down proportionally instead of failing the whole recording.
- */
-async function findAndScrollToText(page, targetText) {
-  const keywords = String(targetText || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .split(/\s+/)
-    .filter((w) => w.length > 3)
-    .slice(0, 6);
-
-  if (keywords.length === 0) return { found: false };
-
-  const result = await page.evaluate((kws) => {
-    function visible(el) {
-      const r = el.getBoundingClientRect();
-      const style = window.getComputedStyle(el);
-      return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-    }
-
-    const candidates = Array.from(document.querySelectorAll('body *')).filter((el) => {
-      if (!visible(el)) return false;
-      const text = (el.textContent || '').trim().toLowerCase();
-      if (!text || text.length > 300) return false;
-      return kws.some((k) => text.includes(k));
-    });
-
-    if (candidates.length === 0) return { found: false };
-
-    // Prefer the smallest matching element (most specific), not a huge wrapping <div>.
-    candidates.sort((a, b) => {
-      const ra = a.getBoundingClientRect();
-      const rb = b.getBoundingClientRect();
-      return ra.width * ra.height - rb.width * rb.height;
-    });
-
-    const el = candidates[0];
-    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-
-    const rect = el.getBoundingClientRect();
-    return { found: true, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
-  }, keywords);
-
-  return result;
-}
-
-async function drawHighlightBox(page, rect) {
-  if (!rect) return;
-  await page.evaluate((r) => {
-    const box = document.createElement('div');
-    box.setAttribute('data-amin-highlight', 'true');
-    box.style.position = 'fixed';
-    box.style.left = r.x - 8 + 'px';
-    box.style.top = r.y - 8 + 'px';
-    box.style.width = r.width + 16 + 'px';
-    box.style.height = r.height + 16 + 'px';
-    box.style.border = '4px solid #ffcc00';
-    box.style.borderRadius = '8px';
-    box.style.boxShadow = '0 0 0 4000px rgba(0,0,0,0.35)';
-    box.style.zIndex = '2147483647';
-    box.style.pointerEvents = 'none';
-    box.style.transition = 'opacity 0.2s ease-in';
-    document.body.appendChild(box);
-  }, rect);
-}
-
-async function clearHighlightBoxes(page) {
-  await page.evaluate(() => {
-    document.querySelectorAll('[data-amin-highlight]').forEach((el) => el.remove());
-  });
-}
-
-async function tryClickText(page, targetText) {
-  const keywords = String(targetText || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .split(/\s+/)
-    .filter((w) => w.length > 3)
-    .slice(0, 6);
-
-  const clicked = await page.evaluate((kws) => {
-    const clickable = Array.from(document.querySelectorAll('a, button, [role="button"]'));
-    const match = clickable.find((el) => {
-      const text = (el.textContent || '').trim().toLowerCase();
-      return text && kws.some((k) => text.includes(k));
-    });
-    if (match) {
-      match.scrollIntoView({ behavior: 'instant', block: 'center' });
-      return true;
-    }
-    return false;
-  }, keywords);
-
-  if (clicked) {
-    try {
-      await page.click(
-        `a:has-text("${keywords[0] || ''}"), button:has-text("${keywords[0] || ''}")`,
-        { timeout: 3000 }
-      );
-      return true;
-    } catch (e) {
-      // Click attempt failed (e.g. overlay, navigation) - fall through to highlight-only.
-      return false;
-    }
-  }
-  return false;
-}
-
-async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDir) {
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT },
-    recordVideo: { dir: outputDir, size: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } }
-  });
-  const page = await context.newPage();
-
-  const startedAt = Date.now();
-
-  try {
-    for (const entry of timeline) {
-      // Real-time pacing so the recording's wall-clock timing matches the scene's start second.
-      const targetElapsedMs = Math.max(0, entry.start * 1000);
-      const actualElapsedMs = Date.now() - startedAt;
-      if (targetElapsedMs > actualElapsedMs) {
-        await sleep(targetElapsedMs - actualElapsedMs);
-      }
-
-      switch (entry.action) {
-        case 'Open': {
-          await page.goto(entry.officialUrl || officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-          break;
-        }
-        case 'Scroll': {
-          await clearHighlightBoxes(page);
-          await findAndScrollToText(page, entry.target);
-          break;
-        }
-        case 'Highlight': {
-          await clearHighlightBoxes(page);
-          const result = await findAndScrollToText(page, entry.target);
-          if (result.found) await drawHighlightBox(page, result.rect);
-          break;
-        }
-        case 'Click': {
-          await clearHighlightBoxes(page);
-          const clicked = await tryClickText(page, entry.target);
-          if (!clicked) {
-            // Graceful fallback: couldn't confidently click anything - highlight instead
-            // rather than risk clicking the wrong element or throwing.
-            const result = await findAndScrollToText(page, entry.target);
-            if (result.found) await drawHighlightBox(page, result.rect);
-          }
-          break;
-        }
-        case 'Wait': {
-          // Nothing to do - the pacing sleep above already covers this.
-          break;
-        }
-        case 'Close': {
-          // Handled by context.close() after the loop; nothing to do mid-timeline.
-          break;
-        }
-        default: {
-          console.warn(`Unknown action "${entry.action}" for sceneId ${entry.sceneId} - skipping.`);
-        }
-      }
-
-      // Hold this scene's state until its "end" time so the recording isn't rushed.
-      const holdUntilMs = Math.max(0, entry.end * 1000);
-      const elapsedNow = Date.now() - startedAt;
-      if (holdUntilMs > elapsedNow) {
-        await sleep(holdUntilMs - elapsedNow);
-      }
-    }
-
-    // Cover any tail time if totalDurationSeconds extends past the last timeline entry.
-    const tailMs = Math.max(0, totalDurationSeconds * 1000 - (Date.now() - startedAt));
-    if (tailMs > 0) await sleep(tailMs);
-  } finally {
-    await page.close();
-  }
-
-  const videoPath = await page.video().path();
-  await context.close();
-  await browser.close();
-
-  return videoPath;
-}
-
-/**
- * Playwright's built-in recorder only outputs .webm, but the platform's contract
- * (per the original architecture: "Playwright Worker → MP4 → Return Video") expects
- * MP4. Converts using the ffmpeg CLI, which must be present in the deployment image
- * (see Dockerfile - installed via apt-get alongside Playwright's own dependencies).
- */
-function webmToMp4(webmPath) {
+function renderPdf(payload) {
   return new Promise((resolve, reject) => {
-    const mp4Path = webmPath.replace(/\.webm$/, '.mp4');
-    const ffmpeg = spawn('ffmpeg', [
-      '-y',
-      '-i', webmPath,
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '23',
-      '-pix_fmt', 'yuv420p',
-      mp4Path
-    ]);
+    try {
+      const doc = new PDFDocument({ margin: 60, size: 'LETTER', bufferPages: true });
+      const stream = new PassThrough();
+      const chunks = [];
+      stream.on('data', (c) => chunks.push(c));
+      stream.on('end', () => resolve(Buffer.concat(chunks)));
+      stream.on('error', reject);
+      doc.pipe(stream);
 
-    let stderr = '';
-    ffmpeg.stderr.on('data', (d) => { stderr += d.toString(); });
-    ffmpeg.on('error', (err) => reject(new Error(`Failed to start ffmpeg (is it installed in this image?): ${err.message}`)));
-    ffmpeg.on('close', (code) => {
-      if (code === 0 && fs.existsSync(mp4Path)) {
-        resolve(mp4Path);
-      } else {
-        reject(new Error(`ffmpeg exited with code ${code}. stderr: ${stderr.slice(-1000)}`));
+      // --- Title page ---
+      doc.fontSize(28).font('Helvetica-Bold').text(payload.title || 'Untitled', { align: 'center' });
+      if (payload.subtitle) {
+        doc.moveDown(0.8);
+        doc.fontSize(14).font('Helvetica').fillColor('#555555').text(payload.subtitle, { align: 'center' });
+        doc.fillColor('#000000');
       }
-    });
+
+      // --- Sections ---
+      const sections = Array.isArray(payload.sections) ? payload.sections : [];
+      sections.forEach((section) => {
+        if (section.pageBreakBefore) {
+          doc.addPage();
+        } else {
+          doc.moveDown(1.5);
+        }
+
+        if (section.heading) {
+          doc.fontSize(18).font('Helvetica-Bold').text(section.heading);
+          doc.moveDown(0.5);
+        }
+        if (section.body) {
+          doc.fontSize(11).font('Helvetica').text(section.body, { align: 'justify' });
+        }
+        if (Array.isArray(section.bulletPoints) && section.bulletPoints.length > 0) {
+          doc.moveDown(0.5);
+          section.bulletPoints.forEach((point) => {
+            doc.fontSize(11).font('Helvetica').text(`•  ${point}`, { indent: 20 });
+          });
+        }
+      });
+
+      // --- Page numbers (footer) ---
+      const range = doc.bufferedPageRange();
+      for (let i = range.start; i < range.start + range.count; i++) {
+        doc.switchToPage(i);
+        doc.fontSize(9).fillColor('#888888').text(
+          `${i + 1} / ${range.count}`,
+          0,
+          doc.page.height - 40,
+          { align: 'center' }
+        );
+      }
+
+      doc.end();
+    } catch (err) {
+      reject(err);
+    }
   });
 }
 
@@ -291,63 +108,52 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', supportedSchemaMajorVersion: SUPPORTED_MAJOR_VERSION });
 });
 
-app.post('/record', async (req, res) => {
-  // --- Auth ---
+app.post('/generate', async (req, res) => {
   if (!WORKER_SECRET) {
     return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
   }
-  const providedSecret = req.get('x-worker-secret') || '';
-  if (providedSecret !== WORKER_SECRET) {
+  if ((req.get('x-worker-secret') || '') !== WORKER_SECRET) {
     return res.status(401).json({ error: 'Unauthorized - missing or incorrect X-Worker-Secret header.' });
   }
 
   const body = req.body || {};
-  const { schemaVersion, officialUrl, totalDurationSeconds, timeline } = body;
+  const { schemaVersion, title, sections } = body;
 
-  // --- Contract validation ---
   if (!schemaVersion || typeof schemaVersion !== 'string') {
     return res.status(400).json({ error: 'Missing or invalid "schemaVersion" field.' });
   }
   const majorVersion = schemaVersion.split('.')[0];
   if (majorVersion !== SUPPORTED_MAJOR_VERSION) {
     return res.status(409).json({
-      error: `Unsupported contract version "${schemaVersion}". This worker only supports major version ${SUPPORTED_MAJOR_VERSION}.x. A breaking Timeline AI change was introduced without updating this worker - update the worker, don't force it.`
+      error: `Unsupported contract version "${schemaVersion}". This worker only supports major version ${SUPPORTED_MAJOR_VERSION}.x.`
     });
   }
-  if (!officialUrl || typeof officialUrl !== 'string') {
-    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' });
+  if (!title || typeof title !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid "title" field.' });
   }
-  if (!Array.isArray(timeline) || timeline.length === 0) {
-    return res.status(400).json({ error: 'Missing or empty "timeline" array.' });
+  if (!Array.isArray(sections) || sections.length === 0) {
+    return res.status(400).json({ error: 'Missing or empty "sections" array.' });
   }
-  const duration = Number(totalDurationSeconds) || timeline[timeline.length - 1].end || 30;
-  if (duration > MAX_TOTAL_DURATION_SECONDS) {
-    return res.status(400).json({ error: `totalDurationSeconds (${duration}) exceeds the ${MAX_TOTAL_DURATION_SECONDS}s safety ceiling.` });
+  if (sections.length > MAX_SECTIONS) {
+    return res.status(400).json({ error: `Too many sections (${sections.length}); safety ceiling is ${MAX_SECTIONS}.` });
   }
-
-  const outputDir = path.join(os.tmpdir(), `amin-recording-${crypto.randomUUID()}`);
-  fs.mkdirSync(outputDir, { recursive: true });
 
   try {
-    const webmPath = await runTimeline(officialUrl, timeline, duration, outputDir);
-    const mp4Path = await webmToMp4(webmPath);
-    const videoBuffer = fs.readFileSync(mp4Path);
-
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', 'attachment; filename="recording.mp4"');
-    res.send(videoBuffer);
+    const pdfBuffer = await renderPdf(body);
+    const safeFilename = (title || 'document').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 60);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}.pdf"`);
+    res.send(pdfBuffer);
   } catch (err) {
-    console.error('Recording failed:', err);
-    res.status(500).json({ error: 'Recording failed', detail: String((err && err.message) || err) });
-  } finally {
-    fs.rm(outputDir, { recursive: true, force: true }, () => {});
+    console.error('PDF generation failed:', err);
+    res.status(500).json({ error: 'PDF generation failed', detail: String((err && err.message) || err) });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Browser Automation Worker listening on port ${PORT}`);
-  console.log(`Supports Timeline AI contract major version: ${SUPPORTED_MAJOR_VERSION}.x`);
+  console.log(`PDF Generator Worker listening on port ${PORT}`);
+  console.log(`Supports contract major version: ${SUPPORTED_MAJOR_VERSION}.x`);
   if (!WORKER_SECRET) {
-    console.warn('WARNING: WORKER_SECRET is not set - /record will reject all requests until it is.');
+    console.warn('WARNING: WORKER_SECRET is not set - /generate will reject all requests until it is.');
   }
 });
