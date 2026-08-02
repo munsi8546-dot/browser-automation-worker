@@ -97,3 +97,7 @@ If `test.pdf` opens and shows "Test Document" with "Section 1", it's working.
 - **Basic typography only** — headings, body text, bullet points, page
   numbers. No tables, columns, or custom fonts out of the box; PDFKit
   supports all of these if a specific product type needs richer layout later.
+  assets) or an upstream image-generation step feeding this worker a URL/binary.
+- **Basic typography only** — headings, body text, bullet points, page
+  numbers. No tables, columns, or custom fonts out of the box; PDFKit
+  supports all of these if a specific product type needs richer layout later.
