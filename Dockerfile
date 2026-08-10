@@ -1,14 +1,15 @@
-FROM node:20-slim
+FROM mcr.microsoft.com/playwright:v1.45.0-jammy
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --omit=dev
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
-COPY server.js ./
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
 
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["node", "server.js"]
 CMD ["node", "server.js"]
