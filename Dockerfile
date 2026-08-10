@@ -5,7 +5,8 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm install --only=production
+RUN npx playwright install chromium
 
 COPY . .
 
