@@ -1,17 +1,16 @@
 {
-  "name": "amin-ai-pdf-generator-worker",
+  "name": "amin-ai-browser-automation-worker",
   "version": "1.0.0",
-  "description": "PDFKit-based PDF generator for the Amin AI Global Opportunity Platform's digital products (ebooks, resume templates, planners, checklists, guides). Consumes a versioned structured-content contract and returns a formatted PDF.",
+  "description": "Playwright-based screen recording worker for Amin AI Global Opportunity Platform",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
     "express": "^4.19.2",
-    "pdfkit": "^0.15.0"
+    "playwright": "^1.45.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
