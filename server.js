@@ -1,38 +1,18 @@
 'use strict';
 
 /**
- * Amin AI Global Opportunity Platform — PDF Generator Worker
- *
- * Consumes a versioned "Digital Product Content Contract v1" and returns a
- * formatted PDF. Deliberately generic across product types (ebook, resume
- * template, planner, checklist, guide, worksheet) - it just renders whatever
- * structure it's given; the Digital Product Content Agent (n8n) decides what
- * content and page-break structure suits each product type.
- *
- * Contract (schemaVersion "1.0"):
- * {
- *   "schemaVersion": "1.0",
- *   "productType": "ebook",
- *   "title": "Study Abroad Budget Planner",
- *   "subtitle": "A practical guide to planning your finances",
- *   "sections": [
- *     {
- *       "heading": "Chapter 1: Understanding Tuition Costs",
- *       "body": "Tuition costs vary significantly by country...",
- *       "bulletPoints": ["Public universities are often cheaper", "..."],
- *       "pageBreakBefore": true
- *     }
- *   ]
- * }
- *
- * VERSIONING RULE (same discipline as the Browser Automation worker's contract):
- * only major version "1" is understood. A "2.x"+ schemaVersion is rejected
- * with a clear 409 rather than guessed at.
+ * Amin AI Global Opportunity Platform — Browser Automation Worker
+ * Playwright-based screen recording worker that consumes a Timeline AI JSON v1.0
+ * and returns an MP4 video binary.
  */
 
 const express = require('express');
-const PDFDocument = require('pdfkit');
-const { PassThrough } = require('stream');
+const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -40,120 +20,213 @@ app.use(express.json({ limit: '5mb' }));
 const PORT = process.env.PORT || 8080;
 const WORKER_SECRET = process.env.WORKER_SECRET || '';
 const SUPPORTED_MAJOR_VERSION = '1';
-const MAX_SECTIONS = 60;
 
-function renderPdf(payload) {
-  return new Promise((resolve, reject) => {
-    try {
-      const doc = new PDFDocument({ margin: 60, size: 'LETTER', bufferPages: true });
-      const stream = new PassThrough();
-      const chunks = [];
-      stream.on('data', (c) => chunks.push(c));
-      stream.on('end', () => resolve(Buffer.concat(chunks)));
-      stream.on('error', reject);
-      doc.pipe(stream);
+const RECORDING_WIDTH = 1080;
+const RECORDING_HEIGHT = 1920;
+const MAX_TOTAL_DURATION_SECONDS = 180;
 
-      // --- Title page ---
-      doc.fontSize(28).font('Helvetica-Bold').text(payload.title || 'Untitled', { align: 'center' });
-      if (payload.subtitle) {
-        doc.moveDown(0.8);
-        doc.fontSize(14).font('Helvetica').fillColor('#555555').text(payload.subtitle, { align: 'center' });
-        doc.fillColor('#000000');
-      }
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-      // --- Sections ---
-      const sections = Array.isArray(payload.sections) ? payload.sections : [];
-      sections.forEach((section) => {
-        if (section.pageBreakBefore) {
-          doc.addPage();
-        } else {
-          doc.moveDown(1.5);
-        }
+async function findAndScrollToText(page, targetText) {
+  const keywords = String(targetText || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 3)
+    .slice(0, 6);
 
-        if (section.heading) {
-          doc.fontSize(18).font('Helvetica-Bold').text(section.heading);
-          doc.moveDown(0.5);
-        }
-        if (section.body) {
-          doc.fontSize(11).font('Helvetica').text(section.body, { align: 'justify' });
-        }
-        if (Array.isArray(section.bulletPoints) && section.bulletPoints.length > 0) {
-          doc.moveDown(0.5);
-          section.bulletPoints.forEach((point) => {
-            doc.fontSize(11).font('Helvetica').text(`•  ${point}`, { indent: 20 });
-          });
-        }
-      });
+  if (keywords.length === 0) return { found: false };
 
-      // --- Page numbers (footer) ---
-      const range = doc.bufferedPageRange();
-      for (let i = range.start; i < range.start + range.count; i++) {
-        doc.switchToPage(i);
-        doc.fontSize(9).fillColor('#888888').text(
-          `${i + 1} / ${range.count}`,
-          0,
-          doc.page.height - 40,
-          { align: 'center' }
-        );
-      }
-
-      doc.end();
-    } catch (err) {
-      reject(err);
+  return await page.evaluate((kws) => {
+    function visible(el) {
+      const r = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
     }
+
+    const candidates = Array.from(document.querySelectorAll('body *')).filter((el) => {
+      if (!visible(el)) return false;
+      const text = (el.textContent || '').trim().toLowerCase();
+      if (!text || text.length > 300) return false;
+      return kws.some((k) => text.includes(k));
+    });
+
+    if (candidates.length === 0) return { found: false };
+
+    candidates.sort((a, b) => {
+      const ra = a.getBoundingClientRect();
+      const rb = b.getBoundingClientRect();
+      return ra.width * ra.height - rb.width * rb.height;
+    });
+
+    const el = candidates[0];
+    el.scrollIntoView({ behavior: 'instant', block: 'center' });
+
+    const rect = el.getBoundingClientRect();
+    return { found: true, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+  }, keywords);
+}
+
+async function drawHighlightBox(page, rect) {
+  if (!rect) return;
+  await page.evaluate((r) => {
+    const box = document.createElement('div');
+    box.setAttribute('data-amin-highlight', 'true');
+    box.style.position = 'fixed';
+    box.style.left = r.x - 8 + 'px';
+    box.style.top = r.y - 8 + 'px';
+    box.style.width = r.width + 16 + 'px';
+    box.style.height = r.height + 16 + 'px';
+    box.style.border = '4px solid #ffcc00';
+    box.style.borderRadius = '8px';
+    box.style.boxShadow = '0 0 0 4000px rgba(0,0,0,0.35)';
+    box.style.zIndex = '2147483647';
+    box.style.pointerEvents = 'none';
+    document.body.appendChild(box);
+  }, rect);
+}
+
+async function clearHighlightBoxes(page) {
+  await page.evaluate(() => {
+    document.querySelectorAll('[data-amin-highlight]').forEach((el) => el.remove());
+  });
+}
+
+async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDir) {
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT },
+    recordVideo: { dir: outputDir, size: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } }
+  });
+
+  const page = await context.newPage();
+  const startedAt = Date.now();
+
+  try {
+    const startUrl = officialUrl && officialUrl.startsWith('http') ? officialUrl : 'https://example.com';
+    await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    if (Array.isArray(timeline)) {
+      for (const entry of timeline) {
+        const targetElapsedMs = Math.max(0, entry.start * 1000);
+        const actualElapsedMs = Date.now() - startedAt;
+        if (targetElapsedMs > actualElapsedMs) {
+          await sleep(targetElapsedMs - actualElapsedMs);
+        }
+
+        switch (entry.action) {
+          case 'Open':
+            if (entry.officialUrl) await page.goto(entry.officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            break;
+          case 'Scroll':
+            await clearHighlightBoxes(page);
+            await findAndScrollToText(page, entry.target);
+            break;
+          case 'Highlight':
+            await clearHighlightBoxes(page);
+            const res = await findAndScrollToText(page, entry.target);
+            if (res.found) await drawHighlightBox(page, res.rect);
+            break;
+        }
+
+        const holdUntilMs = Math.max(0, entry.end * 1000);
+        const elapsedNow = Date.now() - startedAt;
+        if (holdUntilMs > elapsedNow) {
+          await sleep(holdUntilMs - elapsedNow);
+        }
+      }
+    } else {
+      await sleep(5000);
+    }
+  } catch (err) {
+    console.warn('Playback warning:', err.message);
+  }
+
+  const videoPage = page.video();
+  await context.close();
+  await browser.close();
+
+  if (!videoPage) throw new Error('Video recording failed');
+  return await videoPage.path();
+}
+
+function webmToMp4(webmPath) {
+  return new Promise((resolve, reject) => {
+    const mp4Path = webmPath.replace(/\.webm$/, '.mp4');
+    const ffmpeg = spawn('ffmpeg', [
+      '-y',
+      '-i', webmPath,
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '23',
+      '-pix_fmt', 'yuv420p',
+      mp4Path
+    ]);
+
+    let stderr = '';
+    ffmpeg.stderr.on('data', (d) => { stderr += d.toString(); });
+    ffmpeg.on('error', (err) => reject(new Error(`Failed to start ffmpeg: ${err.message}`)));
+    ffmpeg.on('close', (code) => {
+      if (code === 0 && fs.existsSync(mp4Path)) {
+        resolve(mp4Path);
+      } else {
+        reject(new Error(`ffmpeg exited with code ${code}. stderr: ${stderr.slice(-500)}`));
+      }
+    });
   });
 }
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', supportedSchemaMajorVersion: SUPPORTED_MAJOR_VERSION });
+  res.json({ status: 'ok', service: 'browser-automation-worker', supportedSchemaMajorVersion: SUPPORTED_MAJOR_VERSION });
 });
 
-app.post('/generate', async (req, res) => {
-  if (!WORKER_SECRET) {
-    return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
-  }
-  if ((req.get('x-worker-secret') || '') !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized - missing or incorrect X-Worker-Secret header.' });
+app.post('/record', async (req, res) => {
+  if (WORKER_SECRET && (req.get('x-worker-secret') || '') !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized - incorrect X-Worker-Secret header.' });
   }
 
   const body = req.body || {};
-  const { schemaVersion, title, sections } = body;
+  const { schemaVersion, officialUrl, totalDurationSeconds, timeline } = body;
 
   if (!schemaVersion || typeof schemaVersion !== 'string') {
     return res.status(400).json({ error: 'Missing or invalid "schemaVersion" field.' });
   }
+
   const majorVersion = schemaVersion.split('.')[0];
   if (majorVersion !== SUPPORTED_MAJOR_VERSION) {
-    return res.status(409).json({
-      error: `Unsupported contract version "${schemaVersion}". This worker only supports major version ${SUPPORTED_MAJOR_VERSION}.x.`
-    });
-  }
-  if (!title || typeof title !== 'string') {
-    return res.status(400).json({ error: 'Missing or invalid "title" field.' });
-  }
-  if (!Array.isArray(sections) || sections.length === 0) {
-    return res.status(400).json({ error: 'Missing or empty "sections" array.' });
-  }
-  if (sections.length > MAX_SECTIONS) {
-    return res.status(400).json({ error: `Too many sections (${sections.length}); safety ceiling is ${MAX_SECTIONS}.` });
+    return res.status(409).json({ error: `Unsupported contract version "${schemaVersion}".` });
   }
 
+  const duration = Number(totalDurationSeconds) || 30;
+  if (duration > MAX_TOTAL_DURATION_SECONDS) {
+    return res.status(400).json({ error: `totalDurationSeconds exceeds ceiling.` });
+  }
+
+  const outputDir = path.join(os.tmpdir(), `amin-recording-${crypto.randomUUID()}`);
+  fs.mkdirSync(outputDir, { recursive: true });
+
   try {
-    const pdfBuffer = await renderPdf(body);
-    const safeFilename = (title || 'document').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 60);
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}.pdf"`);
-    res.send(pdfBuffer);
+    const webmPath = await runTimeline(officialUrl, timeline, duration, outputDir);
+    const mp4Path = await webmToMp4(webmPath);
+    const videoBuffer = fs.readFileSync(mp4Path);
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', 'attachment; filename="recording.mp4"');
+    res.send(videoBuffer);
   } catch (err) {
-    console.error('PDF generation failed:', err);
-    res.status(500).json({ error: 'PDF generation failed', detail: String((err && err.message) || err) });
+    console.error('Recording failed:', err);
+    res.status(500).json({ error: 'Recording failed', detail: String(err.message || err) });
+  } finally {
+    fs.rm(outputDir, { recursive: true, force: true }, () => {});
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`PDF Generator Worker listening on port ${PORT}`);
-  console.log(`Supports contract major version: ${SUPPORTED_MAJOR_VERSION}.x`);
-  if (!WORKER_SECRET) {
-    console.warn('WARNING: WORKER_SECRET is not set - /generate will reject all requests until it is.');
-  }
+  console.log(`Browser Automation Worker active on port ${PORT}`);
 });
