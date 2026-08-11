@@ -1,11 +1,5 @@
 'use strict';
 
-/**
- * Amin AI Global Opportunity Platform — Browser Automation Worker
- * Playwright-based screen recording worker that consumes a Timeline AI JSON v1.0
- * and returns an MP4 video binary.
- */
-
 const express = require('express');
 const { chromium } = require('playwright');
 const fs = require('fs');
@@ -15,14 +9,15 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 const app = express();
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '2mb' }));
 
 const PORT = process.env.PORT || 8080;
 const WORKER_SECRET = process.env.WORKER_SECRET || '';
 const SUPPORTED_MAJOR_VERSION = '1';
 
-const RECORDING_WIDTH = 1080;
-const RECORDING_HEIGHT = 1920;
+const RECORDING_WIDTH = 720;
+const RECORDING_HEIGHT = 1280;
+
 const MAX_TOTAL_DURATION_SECONDS = 180;
 
 function sleep(ms) {
@@ -39,7 +34,7 @@ async function findAndScrollToText(page, targetText) {
 
   if (keywords.length === 0) return { found: false };
 
-  return await page.evaluate((kws) => {
+  const result = await page.evaluate((kws) => {
     function visible(el) {
       const r = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
@@ -67,6 +62,8 @@ async function findAndScrollToText(page, targetText) {
     const rect = el.getBoundingClientRect();
     return { found: true, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
   }, keywords);
+
+  return result;
 }
 
 async function drawHighlightBox(page, rect) {
@@ -84,6 +81,7 @@ async function drawHighlightBox(page, rect) {
     box.style.boxShadow = '0 0 0 4000px rgba(0,0,0,0.35)';
     box.style.zIndex = '2147483647';
     box.style.pointerEvents = 'none';
+    box.style.transition = 'opacity 0.2s ease-in';
     document.body.appendChild(box);
   }, rect);
 }
@@ -94,66 +92,143 @@ async function clearHighlightBoxes(page) {
   });
 }
 
+async function tryClickText(page, targetText) {
+  const keywords = String(targetText || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 3)
+    .slice(0, 6);
+
+  const clicked = await page.evaluate((kws) => {
+    const clickable = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+    const match = clickable.find((el) => {
+      const text = (el.textContent || '').trim().toLowerCase();
+      return text && kws.some((k) => text.includes(k));
+    });
+    if (match) {
+      match.scrollIntoView({ behavior: 'instant', block: 'center' });
+      return true;
+    }
+    return false;
+  }, keywords);
+
+  if (clicked) {
+    try {
+      await page.click(
+        `a:has-text("${keywords[0] || ''}"), button:has-text("${keywords[0] || ''}")`,
+        { timeout: 3000 }
+      );
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+  return false;
+}
+
 async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDir) {
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: [
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-gpu',
+      '--single-process',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--disable-translate',
+      '--no-first-run',
+      '--disable-component-update',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
+      '--disable-features=TranslateUI',
+      '--disable-ipc-flooding-protection',
+      '--js-flags=--max-old-space-size=256'
+    ]
   });
-
   const context = await browser.newContext({
     viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT },
-    recordVideo: { dir: outputDir, size: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } }
+    recordVideo: { dir: outputDir, size: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } },
+    bypassCSP: true,
+    javaScriptEnabled: true
+  });
+  const page = await context.newPage();
+
+  await page.route('**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot}', route => {
+    if (route.request().resourceType() === 'font') {
+      return route.abort();
+    }
+    return route.continue();
   });
 
-  const page = await context.newPage();
   const startedAt = Date.now();
 
   try {
-    const startUrl = officialUrl && officialUrl.startsWith('http') ? officialUrl : 'https://example.com';
-    await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    for (const entry of timeline) {
+      const targetElapsedMs = Math.max(0, entry.start * 1000);
+      const actualElapsedMs = Date.now() - startedAt;
+      if (targetElapsedMs > actualElapsedMs) {
+        await sleep(targetElapsedMs - actualElapsedMs);
+      }
 
-    if (Array.isArray(timeline)) {
-      for (const entry of timeline) {
-        const targetElapsedMs = Math.max(0, entry.start * 1000);
-        const actualElapsedMs = Date.now() - startedAt;
-        if (targetElapsedMs > actualElapsedMs) {
-          await sleep(targetElapsedMs - actualElapsedMs);
+      switch (entry.action) {
+        case 'Open': {
+          await page.goto(entry.officialUrl || officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          break;
         }
-
-        switch (entry.action) {
-          case 'Open':
-            if (entry.officialUrl) await page.goto(entry.officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            break;
-          case 'Scroll':
-            await clearHighlightBoxes(page);
-            await findAndScrollToText(page, entry.target);
-            break;
-          case 'Highlight':
-            await clearHighlightBoxes(page);
-            const res = await findAndScrollToText(page, entry.target);
-            if (res.found) await drawHighlightBox(page, res.rect);
-            break;
+        case 'Scroll': {
+          await clearHighlightBoxes(page);
+          await findAndScrollToText(page, entry.target);
+          break;
         }
-
-        const holdUntilMs = Math.max(0, entry.end * 1000);
-        const elapsedNow = Date.now() - startedAt;
-        if (holdUntilMs > elapsedNow) {
-          await sleep(holdUntilMs - elapsedNow);
+        case 'Highlight': {
+          await clearHighlightBoxes(page);
+          const result = await findAndScrollToText(page, entry.target);
+          if (result.found) await drawHighlightBox(page, result.rect);
+          break;
+        }
+        case 'Click': {
+          await clearHighlightBoxes(page);
+          const clicked = await tryClickText(page, entry.target);
+          if (!clicked) {
+            const result = await findAndScrollToText(page, entry.target);
+            if (result.found) await drawHighlightBox(page, result.rect);
+          }
+          break;
+        }
+        case 'Wait': {
+          break;
+        }
+        case 'Close': {
+          break;
+        }
+        default: {
+          console.warn(`Unknown action "${entry.action}" for sceneId ${entry.sceneId} - skipping.`);
         }
       }
-    } else {
-      await sleep(5000);
+
+      const holdUntilMs = Math.max(0, entry.end * 1000);
+      const elapsedNow = Date.now() - startedAt;
+      if (holdUntilMs > elapsedNow) {
+        await sleep(holdUntilMs - elapsedNow);
+      }
     }
-  } catch (err) {
-    console.warn('Playback warning:', err.message);
+
+    const tailMs = Math.max(0, totalDurationSeconds * 1000 - (Date.now() - startedAt));
+    if (tailMs > 0) await sleep(tailMs);
+  } finally {
+    await page.close();
   }
 
-  const videoPage = page.video();
+  const videoPath = await page.video().path();
   await context.close();
   await browser.close();
 
-  if (!videoPage) throw new Error('Video recording failed');
-  return await videoPage.path();
+  return videoPath;
 }
 
 function webmToMp4(webmPath) {
@@ -163,9 +238,10 @@ function webmToMp4(webmPath) {
       '-y',
       '-i', webmPath,
       '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '23',
+      '-preset', 'ultrafast',
+      '-crf', '28',
       '-pix_fmt', 'yuv420p',
+      '-threads', '1',
       mp4Path
     ]);
 
@@ -176,19 +252,23 @@ function webmToMp4(webmPath) {
       if (code === 0 && fs.existsSync(mp4Path)) {
         resolve(mp4Path);
       } else {
-        reject(new Error(`ffmpeg exited with code ${code}. stderr: ${stderr.slice(-500)}`));
+        reject(new Error(`ffmpeg exited with code ${code}. stderr: ${stderr.slice(-1000)}`));
       }
     });
   });
 }
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'browser-automation-worker', supportedSchemaMajorVersion: SUPPORTED_MAJOR_VERSION });
+  res.json({ status: 'ok', supportedSchemaMajorVersion: SUPPORTED_MAJOR_VERSION });
 });
 
 app.post('/record', async (req, res) => {
-  if (WORKER_SECRET && (req.get('x-worker-secret') || '') !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized - incorrect X-Worker-Secret header.' });
+  if (!WORKER_SECRET) {
+    return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
+  }
+  const providedSecret = req.get('x-worker-secret') || '';
+  if (providedSecret !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized - missing or incorrect X-Worker-Secret header.' });
   }
 
   const body = req.body || {};
@@ -197,15 +277,21 @@ app.post('/record', async (req, res) => {
   if (!schemaVersion || typeof schemaVersion !== 'string') {
     return res.status(400).json({ error: 'Missing or invalid "schemaVersion" field.' });
   }
-
   const majorVersion = schemaVersion.split('.')[0];
   if (majorVersion !== SUPPORTED_MAJOR_VERSION) {
-    return res.status(409).json({ error: `Unsupported contract version "${schemaVersion}".` });
+    return res.status(409).json({
+      error: `Unsupported contract version "${schemaVersion}". This worker only supports major version ${SUPPORTED_MAJOR_VERSION}.x.`
+    });
   }
-
-  const duration = Number(totalDurationSeconds) || 30;
+  if (!officialUrl || typeof officialUrl !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' });
+  }
+  if (!Array.isArray(timeline) || timeline.length === 0) {
+    return res.status(400).json({ error: 'Missing or empty "timeline" array.' });
+  }
+  const duration = Number(totalDurationSeconds) || timeline[timeline.length - 1].end || 30;
   if (duration > MAX_TOTAL_DURATION_SECONDS) {
-    return res.status(400).json({ error: `totalDurationSeconds exceeds ceiling.` });
+    return res.status(400).json({ error: `totalDurationSeconds (${duration}) exceeds the ${MAX_TOTAL_DURATION_SECONDS}s safety ceiling.` });
   }
 
   const outputDir = path.join(os.tmpdir(), `amin-recording-${crypto.randomUUID()}`);
@@ -221,12 +307,17 @@ app.post('/record', async (req, res) => {
     res.send(videoBuffer);
   } catch (err) {
     console.error('Recording failed:', err);
-    res.status(500).json({ error: 'Recording failed', detail: String(err.message || err) });
+    res.status(500).json({ error: 'Recording failed', detail: String((err && err.message) || err) });
   } finally {
     fs.rm(outputDir, { recursive: true, force: true }, () => {});
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Browser Automation Worker active on port ${PORT}`);
+  console.log(`Browser Automation Worker listening on port ${PORT}`);
+  console.log(`Supports Timeline AI contract major version: ${SUPPORTED_MAJOR_VERSION}.x`);
+  console.log(`Recording resolution: ${RECORDING_WIDTH}x${RECORDING_HEIGHT} (optimized for low memory)`);
+  if (!WORKER_SECRET) {
+    console.warn('WARNING: WORKER_SECRET is not set - /record will reject all requests until it is.');
+  }
 });
