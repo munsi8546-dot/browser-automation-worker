@@ -15,8 +15,8 @@ const PORT = process.env.PORT || 8080;
 const WORKER_SECRET = process.env.WORKER_SECRET || '';
 const SUPPORTED_MAJOR_VERSION = '1';
 
-const RECORDING_WIDTH = 720;
-const RECORDING_HEIGHT = 1280;
+const RECORDING_WIDTH = 1080;
+const RECORDING_HEIGHT = 1920;
 
 const MAX_TOTAL_DURATION_SECONDS = 180;
 
@@ -134,36 +134,19 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
       '--disable-dev-shm-usage',
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      '--disable-gpu',
-      '--single-process',
       '--disable-extensions',
       '--disable-background-networking',
       '--disable-default-apps',
       '--disable-sync',
       '--disable-translate',
-      '--no-first-run',
-      '--disable-component-update',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-      '--disable-features=TranslateUI',
-      '--disable-ipc-flooding-protection',
-      '--js-flags=--max-old-space-size=256'
+      '--no-first-run'
     ]
   });
   const context = await browser.newContext({
     viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT },
-    recordVideo: { dir: outputDir, size: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } },
-    bypassCSP: true,
-    javaScriptEnabled: true
+    recordVideo: { dir: outputDir, size: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } }
   });
   const page = await context.newPage();
-
-  await page.route('**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot}', route => {
-    if (route.request().resourceType() === 'font') {
-      return route.abort();
-    }
-    return route.continue();
-  });
 
   const startedAt = Date.now();
 
@@ -238,10 +221,9 @@ function webmToMp4(webmPath) {
       '-y',
       '-i', webmPath,
       '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-crf', '28',
+      '-preset', 'veryfast',
+      '-crf', '23',
       '-pix_fmt', 'yuv420p',
-      '-threads', '1',
       mp4Path
     ]);
 
@@ -316,7 +298,7 @@ app.post('/record', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Browser Automation Worker listening on port ${PORT}`);
   console.log(`Supports Timeline AI contract major version: ${SUPPORTED_MAJOR_VERSION}.x`);
-  console.log(`Recording resolution: ${RECORDING_WIDTH}x${RECORDING_HEIGHT} (optimized for low memory)`);
+  console.log(`Recording resolution: ${RECORDING_WIDTH}x${RECORDING_HEIGHT}`);
   if (!WORKER_SECRET) {
     console.warn('WARNING: WORKER_SECRET is not set - /record will reject all requests until it is.');
   }
