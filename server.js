@@ -1,3 +1,4 @@
+```javascript
 'use strict';
 
 const express = require('express');
@@ -15,8 +16,8 @@ const PORT = process.env.PORT || 8080;
 const WORKER_SECRET = process.env.WORKER_SECRET || '';
 const SUPPORTED_MAJOR_VERSION = '1';
 
-const RECORDING_WIDTH = 1080;
-const RECORDING_HEIGHT = 1920;
+const RECORDING_WIDTH = 720;
+const RECORDING_HEIGHT = 1280;
 
 const MAX_TOTAL_DURATION_SECONDS = 180;
 
@@ -303,3 +304,6 @@ app.listen(PORT, () => {
     console.warn('WARNING: WORKER_SECRET is not set - /record will reject all requests until it is.');
   }
 });
+```
+
+**Ctrl+A → Delete → Paste → Commit → Railway-তে "Check for updates" → Deploy হলে n8n-এ "Execute workflow" চাপো** 🎯
