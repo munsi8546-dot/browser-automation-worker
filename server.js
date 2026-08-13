@@ -305,5 +305,3 @@ app.listen(PORT, () => {
   }
 });
 ```
-
-**Ctrl+A → Delete → Paste → Commit → Railway-তে "Check for updates" → Deploy হলে n8n-এ "Execute workflow" চাপো** 🎯
