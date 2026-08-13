@@ -19,6 +19,7 @@ const RECORDING_WIDTH = 720;
 const RECORDING_HEIGHT = 1280;
 
 const MAX_TOTAL_DURATION_SECONDS = 180;
+const DEBUG_SCREENSHOT_TIMEOUT_SECONDS = 45;
 
 function sleep(ms) {
   return new Promise(function(resolve) { setTimeout(resolve, ms); });
@@ -287,6 +288,117 @@ app.post('/record', async function(req, res) {
     res.status(500).json({ error: 'Recording failed', detail: String((err && err.message) || err) });
   } finally {
     fs.rm(outputDir, { recursive: true, force: true }, function() {});
+  }
+});
+
+// --- Diagnostic endpoint (temporary) ---
+// Loads a page with NO video recording attached, takes a plain screenshot,
+// and reports console/page/network errors. Used to isolate whether the
+// black-video bug is in page rendering itself vs. the recordVideo/ffmpeg
+// pipeline. Does not touch /record, ffmpeg, or any downstream Cloudinary/
+// Drive/n8n logic.
+app.post('/debug-screenshot', async function(req, res) {
+  if (!WORKER_SECRET) {
+    return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
+  }
+  var providedSecret = req.get('x-worker-secret') || '';
+  if (providedSecret !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized - missing or incorrect X-Worker-Secret header.' });
+  }
+
+  var body = req.body || {};
+  var officialUrl = body.officialUrl;
+  if (!officialUrl || typeof officialUrl !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' });
+  }
+
+  var consoleLogs = [];
+  var pageErrors = [];
+  var requestFailures = [];
+  var browser = null;
+  var timedOut = false;
+
+  var timeoutHandle = setTimeout(function() {
+    timedOut = true;
+  }, DEBUG_SCREENSHOT_TIMEOUT_SECONDS * 1000);
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-translate',
+        '--no-first-run'
+      ]
+    });
+
+    var context = await browser.newContext({
+      viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT }
+      // Deliberately no recordVideo here - isolating page render from video capture.
+    });
+    var page = await context.newPage();
+
+    page.on('console', function(msg) {
+      consoleLogs.push(msg.type() + ': ' + msg.text());
+    });
+    page.on('pageerror', function(err) {
+      pageErrors.push(String(err));
+    });
+    page.on('requestfailed', function(request) {
+      var failure = request.failure();
+      requestFailures.push(request.url() + ' -> ' + (failure ? failure.errorText : 'unknown error'));
+    });
+
+    var navError = null;
+    try {
+      await page.goto(officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (err) {
+      navError = String((err && err.message) || err);
+    }
+
+    if (timedOut) {
+      throw new Error('Debug screenshot exceeded ' + DEBUG_SCREENSHOT_TIMEOUT_SECONDS + 's timeout before screenshot could be taken.');
+    }
+
+    // Let the page settle/paint before capturing.
+    await page.waitForTimeout(2000);
+
+    var screenshotBuffer = await page.screenshot({ type: 'png' });
+
+    clearTimeout(timeoutHandle);
+
+    res.setHeader('Content-Type', 'application/json');
+    res.json({
+      navigationError: navError,
+      screenshotBase64: screenshotBuffer.toString('base64'),
+      consoleLogs: consoleLogs,
+      pageErrors: pageErrors,
+      requestFailures: requestFailures
+    });
+  } catch (err) {
+    clearTimeout(timeoutHandle);
+    console.error('Debug screenshot failed:', err);
+    res.status(500).json({
+      error: 'Debug screenshot failed',
+      detail: String((err && err.message) || err),
+      consoleLogs: consoleLogs,
+      pageErrors: pageErrors,
+      requestFailures: requestFailures
+    });
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (closeErr) {
+        console.error('Error closing browser in /debug-screenshot:', closeErr);
+      }
+    }
   }
 });
 
