@@ -126,6 +126,31 @@ async function tryClickText(page, targetText) {
   return false;
 }
 
+async function tryAcceptCookieBanner(page) {
+  try {
+    var clicked = await page.evaluate(function() {
+      var targetPhrase = 'accept only necessary cookies';
+      var candidates = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+      var match = candidates.find(function(el) {
+        var text = (el.innerText || el.textContent || el.value || '').trim().toLowerCase();
+        return text.indexOf(targetPhrase) !== -1;
+      });
+      if (match) {
+        match.scrollIntoView({ behavior: 'instant', block: 'center' });
+        match.click();
+        return true;
+      }
+      return false;
+    });
+
+    if (clicked) {
+      await sleep(1000);
+    }
+  } catch (e) {
+    // No banner present, or click failed -- ignore and continue.
+  }
+}
+
 async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDir) {
   var browser = await chromium.launch({
     headless: true,
@@ -161,6 +186,7 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
       switch (entry.action) {
         case 'Open':
           await page.goto(entry.officialUrl || officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await tryAcceptCookieBanner(page);
           break;
         case 'Scroll':
           await clearHighlightBoxes(page);
@@ -291,12 +317,6 @@ app.post('/record', async function(req, res) {
   }
 });
 
-// --- Diagnostic endpoint (temporary) ---
-// Loads a page with NO video recording attached, takes a plain screenshot,
-// and reports console/page/network errors. Used to isolate whether the
-// black-video bug is in page rendering itself vs. the recordVideo/ffmpeg
-// pipeline. Does not touch /record, ffmpeg, or any downstream Cloudinary/
-// Drive/n8n logic.
 app.post('/debug-screenshot', async function(req, res) {
   if (!WORKER_SECRET) {
     return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
@@ -340,7 +360,6 @@ app.post('/debug-screenshot', async function(req, res) {
 
     var context = await browser.newContext({
       viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT }
-      // Deliberately no recordVideo here - isolating page render from video capture.
     });
     var page = await context.newPage();
 
@@ -366,7 +385,6 @@ app.post('/debug-screenshot', async function(req, res) {
       throw new Error('Debug screenshot exceeded ' + DEBUG_SCREENSHOT_TIMEOUT_SECONDS + 's timeout before screenshot could be taken.');
     }
 
-    // Let the page settle/paint before capturing.
     await page.waitForTimeout(2000);
 
     var screenshotBuffer = await page.screenshot({ type: 'png' });
