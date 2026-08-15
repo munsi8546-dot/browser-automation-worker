@@ -26,30 +26,45 @@ function sleep(ms) {
 }
 
 async function findAndScrollToText(page, targetText) {
-  var keywords = String(targetText || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(function(w) { return w.length > 3; }).slice(0, 6);
+  var keywords = String(targetText || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(function(w) { return w.length > 3; })
+    .slice(0, 6);
+
   if (keywords.length === 0) return { found: false };
 
-  return await page.evaluate(function(kws) {
+  var result = await page.evaluate(function(kws) {
     function visible(el) {
       var r = el.getBoundingClientRect();
       var style = window.getComputedStyle(el);
       return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
     }
+
     var candidates = Array.from(document.querySelectorAll('body *')).filter(function(el) {
       if (!visible(el)) return false;
       var text = (el.textContent || '').trim().toLowerCase();
       if (!text || text.length > 300) return false;
       return kws.some(function(k) { return text.includes(k); });
     });
+
     if (candidates.length === 0) return { found: false };
+
     candidates.sort(function(a, b) {
-      return (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height);
+      var ra = a.getBoundingClientRect();
+      var rb = b.getBoundingClientRect();
+      return ra.width * ra.height - rb.width * rb.height;
     });
+
     var el = candidates[0];
     el.scrollIntoView({ behavior: 'instant', block: 'center' });
+
     var rect = el.getBoundingClientRect();
     return { found: true, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
   }, keywords);
+
+  return result;
 }
 
 async function drawHighlightBox(page, rect) {
@@ -67,6 +82,7 @@ async function drawHighlightBox(page, rect) {
     box.style.boxShadow = '0 0 0 4000px rgba(0,0,0,0.35)';
     box.style.zIndex = '2147483647';
     box.style.pointerEvents = 'none';
+    box.style.transition = 'opacity 0.2s ease-in';
     document.body.appendChild(box);
   }, rect);
 }
@@ -78,7 +94,13 @@ async function clearHighlightBoxes(page) {
 }
 
 async function tryClickText(page, targetText) {
-  var keywords = String(targetText || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(function(w) { return w.length > 3; }).slice(0, 6);
+  var keywords = String(targetText || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(function(w) { return w.length > 3; })
+    .slice(0, 6);
+
   var clicked = await page.evaluate(function(kws) {
     var clickable = Array.from(document.querySelectorAll('a, button, [role="button"]'));
     var match = clickable.find(function(el) {
@@ -91,15 +113,30 @@ async function tryClickText(page, targetText) {
     }
     return false;
   }, keywords);
+
   if (clicked) {
     try {
-      await page.click('a:has-text("' + (keywords[0] || '') + '"), button:has-text("' + (keywords[0] || '') + '")', { timeout: 3000 });
+      var selector = 'a:has-text("' + (keywords[0] || '') + '"), button:has-text("' + (keywords[0] || '') + '")';
+      await page.click(selector, { timeout: 3000 });
       return true;
-    } catch (e) { return false; }
+    } catch (e) {
+      return false;
+    }
   }
   return false;
 }
 
+// --- Cookie banner suppression (Issue A fix, v2) ---
+// v1 clicked the "Accept only necessary cookies" button directly, which
+// caused the recorded video to go 100% black (confirmed via /debug-screenshot
+// + Railway logs: page renders fine with no click; recording pipeline threw
+// no errors yet produced black frames the moment the click was added --
+// almost certainly the site's consent script disrupting the page/compositor
+// on click). To avoid that risk entirely, this version never simulates a
+// click or triggers any consent-script side effects. It just walks up from
+// the matched button to the nearest fixed/sticky-positioned ancestor (the
+// banner container) and hides it with display:none. No navigation, no JS
+// handlers fired, nothing for the recording pipeline to trip over.
 async function tryHideCookieBanner(page) {
   try {
     await page.evaluate(function() {
@@ -109,7 +146,8 @@ async function tryHideCookieBanner(page) {
         var text = (el.innerText || el.textContent || el.value || '').trim().toLowerCase();
         return text.indexOf(targetPhrase) !== -1;
       });
-      if (!match) return;
+      if (!match) return false;
+
       var container = match;
       var el = match;
       for (var i = 0; i < 6 && el; i++) {
@@ -122,19 +160,42 @@ async function tryHideCookieBanner(page) {
         if (el) container = el;
       }
       container.style.display = 'none';
+      return true;
     });
-  } catch (e) {}
+  } catch (e) {
+    // No banner present, or hide failed for an unrelated reason -- ignore
+    // and continue with the timeline. Never let this break /record.
+  }
 }
 
 async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDir) {
   var browser = await chromium.launch({
     headless: true,
-    args: ['--disable-dev-shm-usage', '--no-sandbox', '--disable-setuid-sandbox', '--disable-extensions', '--disable-background-networking', '--no-first-run']
+    args: [
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--disable-translate',
+      '--no-first-run'
+    ]
   });
-  var context = await browser.newContext({ viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } });
+  var context = await browser.newContext({
+    viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT }
+  });
   var page = await context.newPage();
+
   var startedAt = Date.now();
 
+  // --- Screenshot-loop capture (replaces context.recordVideo) ---
+  // recordVideo produced clean, non-erroring but 100% black output on
+  // Railway's containers -- a known headless-Chromium/compositor issue.
+  // page.screenshot() goes through a different code path and does not
+  // depend on the video/compositor pipeline, so it sidesteps that failure
+  // mode entirely.
   var frameCounter = 0;
   var capturing = true;
   var captureLoopPromise = (async function() {
@@ -145,9 +206,14 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
         var frameName = 'frame-' + String(frameCounter).padStart(6, '0') + '.jpg';
         var frameBuffer = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
         fs.writeFileSync(path.join(outputDir, frameName), frameBuffer);
-      } catch (err) {}
+      } catch (err) {
+        // Page may be mid-navigation or briefly unavailable -- log and keep
+        // going. A missed frame or two must never stop the loop or /record.
+        console.warn('Screenshot loop frame ' + frameCounter + ' failed: ' + String((err && err.message) || err));
+      }
       var elapsed = Date.now() - loopStart;
-      await sleep(Math.max(0, 100 - elapsed));
+      var waitMs = Math.max(0, 100 - elapsed);
+      await sleep(waitMs);
     }
   })();
 
@@ -156,7 +222,9 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
       var entry = timeline[i];
       var targetElapsedMs = Math.max(0, entry.start * 1000);
       var actualElapsedMs = Date.now() - startedAt;
-      if (targetElapsedMs > actualElapsedMs) await sleep(targetElapsedMs - actualElapsedMs);
+      if (targetElapsedMs > actualElapsedMs) {
+        await sleep(targetElapsedMs - actualElapsedMs);
+      }
 
       switch (entry.action) {
         case 'Open':
@@ -180,10 +248,21 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
             if (clResult.found) await drawHighlightBox(page, clResult.rect);
           }
           break;
+        case 'Wait':
+          break;
+        case 'Close':
+          break;
+        default:
+          console.warn('Unknown action "' + entry.action + '" for sceneId ' + entry.sceneId + ' - skipping.');
       }
+
       var holdUntilMs = Math.max(0, entry.end * 1000);
-      if (holdUntilMs > (Date.now() - startedAt)) await sleep(holdUntilMs - (Date.now() - startedAt));
+      var elapsedNow = Date.now() - startedAt;
+      if (holdUntilMs > elapsedNow) {
+        await sleep(holdUntilMs - elapsedNow);
+      }
     }
+
     var tailMs = Math.max(0, totalDurationSeconds * 1000 - (Date.now() - startedAt));
     if (tailMs > 0) await sleep(tailMs);
   } finally {
@@ -193,20 +272,33 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
     await context.close();
     await browser.close();
   }
+
   return { outputDir: outputDir, frameCount: frameCounter };
 }
 
 function framesToMp4(outputDir, mp4Path) {
   return new Promise(function(resolve, reject) {
     var ffmpeg = spawn('ffmpeg', [
-      '-y', '-framerate', '10', '-i', path.join(outputDir, 'frame-%06d.jpg'),
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-vf', 'scale=720:1280,fps=30', mp4Path
+      '-y',
+      '-framerate', '10',
+      '-i', path.join(outputDir, 'frame-%06d.jpg'),
+      '-c:v', 'libx264',
+      '-preset', 'veryfast',
+      '-crf', '23',
+      '-pix_fmt', 'yuv420p',
+      '-vf', 'scale=720:1280,fps=30',
+      mp4Path
     ]);
+
     var stderr = '';
     ffmpeg.stderr.on('data', function(d) { stderr += d.toString(); });
+    ffmpeg.on('error', function(err) { reject(new Error('Failed to start ffmpeg: ' + err.message)); });
     ffmpeg.on('close', function(code) {
-      if (code === 0 && fs.existsSync(mp4Path)) resolve(mp4Path);
-      else reject(new Error('ffmpeg failed code ' + code + ': ' + stderr.slice(-500)));
+      if (code === 0 && fs.existsSync(mp4Path)) {
+        resolve(mp4Path);
+      } else {
+        reject(new Error('ffmpeg exited with code ' + code + '. stderr: ' + stderr.slice(-1000)));
+      }
     });
   });
 }
@@ -216,32 +308,177 @@ app.get('/health', function(req, res) {
 });
 
 app.post('/record', async function(req, res) {
-  if (!WORKER_SECRET || req.get('x-worker-secret') !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
+  if (!WORKER_SECRET) {
+    return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
   }
+  var providedSecret = req.get('x-worker-secret') || '';
+  if (providedSecret !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized - missing or incorrect X-Worker-Secret header.' });
+  }
+
   var body = req.body || {};
-  if (!body.officialUrl || !Array.isArray(body.timeline)) {
-    return res.status(400).json({ error: 'Invalid payload' });
+  var schemaVersion = body.schemaVersion;
+  var officialUrl = body.officialUrl;
+  var totalDurationSeconds = body.totalDurationSeconds;
+  var timeline = body.timeline;
+
+  if (!schemaVersion || typeof schemaVersion !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid "schemaVersion" field.' });
   }
-  var duration = Number(body.totalDurationSeconds) || body.timeline[body.timeline.length - 1].end || 30;
+  var majorVersion = schemaVersion.split('.')[0];
+  if (majorVersion !== SUPPORTED_MAJOR_VERSION) {
+    return res.status(409).json({
+      error: 'Unsupported contract version "' + schemaVersion + '". This worker only supports major version ' + SUPPORTED_MAJOR_VERSION + '.x.'
+    });
+  }
+  if (!officialUrl || typeof officialUrl !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' });
+  }
+  if (!Array.isArray(timeline) || timeline.length === 0) {
+    return res.status(400).json({ error: 'Missing or empty "timeline" array.' });
+  }
+  var duration = Number(totalDurationSeconds) || timeline[timeline.length - 1].end || 30;
+  if (duration > MAX_TOTAL_DURATION_SECONDS) {
+    return res.status(400).json({ error: 'totalDurationSeconds (' + duration + ') exceeds the ' + MAX_TOTAL_DURATION_SECONDS + 's safety ceiling.' });
+  }
+
   var outputDir = path.join(os.tmpdir(), 'amin-recording-' + crypto.randomUUID());
   fs.mkdirSync(outputDir, { recursive: true });
   var mp4Path = path.join(outputDir, 'recording.mp4');
 
   try {
-    await runTimeline(body.officialUrl, body.timeline, duration, outputDir);
+    var captureResult = await runTimeline(officialUrl, timeline, duration, outputDir);
+    console.log('Screenshot loop captured ' + captureResult.frameCount + ' frames.');
     await framesToMp4(outputDir, mp4Path);
     var videoBuffer = fs.readFileSync(mp4Path);
+
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', 'attachment; filename="recording.mp4"');
     res.send(videoBuffer);
   } catch (err) {
-    res.status(500).json({ error: 'Recording failed', detail: String(err.message || err) });
+    console.error('Recording failed:', err);
+    res.status(500).json({ error: 'Recording failed', detail: String((err && err.message) || err) });
   } finally {
     fs.rm(outputDir, { recursive: true, force: true }, function() {});
   }
 });
 
+// --- Diagnostic endpoint (temporary) ---
+// Loads a page with NO video recording attached, takes a plain screenshot,
+// and reports console/page/network errors. Used to isolate whether the
+// black-video bug is in page rendering itself vs. the recordVideo/ffmpeg
+// pipeline. Does not touch /record, ffmpeg, or any downstream Cloudinary/
+// Drive/n8n logic.
+app.post('/debug-screenshot', async function(req, res) {
+  if (!WORKER_SECRET) {
+    return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
+  }
+  var providedSecret = req.get('x-worker-secret') || '';
+  if (providedSecret !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized - missing or incorrect X-Worker-Secret header.' });
+  }
+
+  var body = req.body || {};
+  var officialUrl = body.officialUrl;
+  if (!officialUrl || typeof officialUrl !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' });
+  }
+
+  var consoleLogs = [];
+  var pageErrors = [];
+  var requestFailures = [];
+  var browser = null;
+  var timedOut = false;
+
+  var timeoutHandle = setTimeout(function() {
+    timedOut = true;
+  }, DEBUG_SCREENSHOT_TIMEOUT_SECONDS * 1000);
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-translate',
+        '--no-first-run'
+      ]
+    });
+
+    var context = await browser.newContext({
+      viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT }
+      // Deliberately no recordVideo here - isolating page render from video capture.
+    });
+    var page = await context.newPage();
+
+    page.on('console', function(msg) {
+      consoleLogs.push(msg.type() + ': ' + msg.text());
+    });
+    page.on('pageerror', function(err) {
+      pageErrors.push(String(err));
+    });
+    page.on('requestfailed', function(request) {
+      var failure = request.failure();
+      requestFailures.push(request.url() + ' -> ' + (failure ? failure.errorText : 'unknown error'));
+    });
+
+    var navError = null;
+    try {
+      await page.goto(officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (err) {
+      navError = String((err && err.message) || err);
+    }
+
+    if (timedOut) {
+      throw new Error('Debug screenshot exceeded ' + DEBUG_SCREENSHOT_TIMEOUT_SECONDS + 's timeout before screenshot could be taken.');
+    }
+
+    // Let the page settle/paint before capturing.
+    await page.waitForTimeout(2000);
+
+    var screenshotBuffer = await page.screenshot({ type: 'png' });
+
+    clearTimeout(timeoutHandle);
+
+    res.setHeader('Content-Type', 'application/json');
+    res.json({
+      navigationError: navError,
+      screenshotBase64: screenshotBuffer.toString('base64'),
+      consoleLogs: consoleLogs,
+      pageErrors: pageErrors,
+      requestFailures: requestFailures
+    });
+  } catch (err) {
+    clearTimeout(timeoutHandle);
+    console.error('Debug screenshot failed:', err);
+    res.status(500).json({
+      error: 'Debug screenshot failed',
+      detail: String((err && err.message) || err),
+      consoleLogs: consoleLogs,
+      pageErrors: pageErrors,
+      requestFailures: requestFailures
+    });
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (closeErr) {
+        console.error('Error closing browser in /debug-screenshot:', closeErr);
+      }
+    }
+  }
+});
+
 app.listen(PORT, function() {
-  console.log('Worker listening on port ' + PORT);
+  console.log('Browser Automation Worker listening on port ' + PORT);
+  console.log('Supports Timeline AI contract major version: ' + SUPPORTED_MAJOR_VERSION + '.x');
+  console.log('Recording resolution: ' + RECORDING_WIDTH + 'x' + RECORDING_HEIGHT);
+  if (!WORKER_SECRET) {
+    console.warn('WARNING: WORKER_SECRET is not set - /record will reject all requests until it is.');
+  }
 });
