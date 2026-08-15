@@ -126,28 +126,33 @@ async function tryClickText(page, targetText) {
   return false;
 }
 
-async function tryAcceptCookieBanner(page) {
+async function tryHideCookieBanner(page) {
   try {
-    var clicked = await page.evaluate(function() {
+    await page.evaluate(function() {
       var targetPhrase = 'accept only necessary cookies';
       var candidates = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
       var match = candidates.find(function(el) {
         var text = (el.innerText || el.textContent || el.value || '').trim().toLowerCase();
         return text.indexOf(targetPhrase) !== -1;
       });
-      if (match) {
-        match.scrollIntoView({ behavior: 'instant', block: 'center' });
-        match.click();
-        return true;
-      }
-      return false;
-    });
+      if (!match) return false;
 
-    if (clicked) {
-      await sleep(1000);
-    }
+      var container = match;
+      var el = match;
+      for (var i = 0; i < 6 && el; i++) {
+        var style = window.getComputedStyle(el);
+        if (style.position === 'fixed' || style.position === 'sticky') {
+          container = el;
+          break;
+        }
+        el = el.parentElement;
+        if (el) container = el;
+      }
+      container.style.display = 'none';
+      return true;
+    });
   } catch (e) {
-    // No banner present, or click failed -- ignore and continue.
+    // No banner present, or hide failed -- ignore.
   }
 }
 
@@ -186,7 +191,7 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
       switch (entry.action) {
         case 'Open':
           await page.goto(entry.officialUrl || officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await tryAcceptCookieBanner(page);
+          await tryHideCookieBanner(page);
           break;
         case 'Scroll':
           await clearHighlightBoxes(page);
