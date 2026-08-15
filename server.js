@@ -26,45 +26,30 @@ function sleep(ms) {
 }
 
 async function findAndScrollToText(page, targetText) {
-  var keywords = String(targetText || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .split(/\s+/)
-    .filter(function(w) { return w.length > 3; })
-    .slice(0, 6);
-
+  var keywords = String(targetText || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(function(w) { return w.length > 3; }).slice(0, 6);
   if (keywords.length === 0) return { found: false };
 
-  var result = await page.evaluate(function(kws) {
+  return await page.evaluate(function(kws) {
     function visible(el) {
       var r = el.getBoundingClientRect();
       var style = window.getComputedStyle(el);
       return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
     }
-
     var candidates = Array.from(document.querySelectorAll('body *')).filter(function(el) {
       if (!visible(el)) return false;
       var text = (el.textContent || '').trim().toLowerCase();
       if (!text || text.length > 300) return false;
       return kws.some(function(k) { return text.includes(k); });
     });
-
     if (candidates.length === 0) return { found: false };
-
     candidates.sort(function(a, b) {
-      var ra = a.getBoundingClientRect();
-      var rb = b.getBoundingClientRect();
-      return ra.width * ra.height - rb.width * rb.height;
+      return (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height);
     });
-
     var el = candidates[0];
     el.scrollIntoView({ behavior: 'instant', block: 'center' });
-
     var rect = el.getBoundingClientRect();
     return { found: true, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
   }, keywords);
-
-  return result;
 }
 
 async function drawHighlightBox(page, rect) {
@@ -82,7 +67,6 @@ async function drawHighlightBox(page, rect) {
     box.style.boxShadow = '0 0 0 4000px rgba(0,0,0,0.35)';
     box.style.zIndex = '2147483647';
     box.style.pointerEvents = 'none';
-    box.style.transition = 'opacity 0.2s ease-in';
     document.body.appendChild(box);
   }, rect);
 }
@@ -94,13 +78,7 @@ async function clearHighlightBoxes(page) {
 }
 
 async function tryClickText(page, targetText) {
-  var keywords = String(targetText || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .split(/\s+/)
-    .filter(function(w) { return w.length > 3; })
-    .slice(0, 6);
-
+  var keywords = String(targetText || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(function(w) { return w.length > 3; }).slice(0, 6);
   var clicked = await page.evaluate(function(kws) {
     var clickable = Array.from(document.querySelectorAll('a, button, [role="button"]'));
     var match = clickable.find(function(el) {
@@ -113,15 +91,11 @@ async function tryClickText(page, targetText) {
     }
     return false;
   }, keywords);
-
   if (clicked) {
     try {
-      var selector = 'a:has-text("' + (keywords[0] || '') + '"), button:has-text("' + (keywords[0] || '') + '")';
-      await page.click(selector, { timeout: 3000 });
+      await page.click('a:has-text("' + (keywords[0] || '') + '"), button:has-text("' + (keywords[0] || '') + '")', { timeout: 3000 });
       return true;
-    } catch (e) {
-      return false;
-    }
+    } catch (e) { return false; }
   }
   return false;
 }
@@ -135,8 +109,7 @@ async function tryHideCookieBanner(page) {
         var text = (el.innerText || el.textContent || el.value || '').trim().toLowerCase();
         return text.indexOf(targetPhrase) !== -1;
       });
-      if (!match) return false;
-
+      if (!match) return;
       var container = match;
       var el = match;
       for (var i = 0; i < 6 && el; i++) {
@@ -149,33 +122,17 @@ async function tryHideCookieBanner(page) {
         if (el) container = el;
       }
       container.style.display = 'none';
-      return true;
     });
-  } catch (e) {
-    // No banner present -- ignore.
-  }
+  } catch (e) {}
 }
 
 async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDir) {
   var browser = await chromium.launch({
     headless: true,
-    args: [
-      '--disable-dev-shm-usage',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-extensions',
-      '--disable-background-networking',
-      '--disable-default-apps',
-      '--disable-sync',
-      '--disable-translate',
-      '--no-first-run'
-    ]
+    args: ['--disable-dev-shm-usage', '--no-sandbox', '--disable-setuid-sandbox', '--disable-extensions', '--disable-background-networking', '--no-first-run']
   });
-  var context = await browser.newContext({
-    viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT }
-  });
+  var context = await browser.newContext({ viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } });
   var page = await context.newPage();
-
   var startedAt = Date.now();
 
   var frameCounter = 0;
@@ -188,12 +145,9 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
         var frameName = 'frame-' + String(frameCounter).padStart(6, '0') + '.jpg';
         var frameBuffer = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
         fs.writeFileSync(path.join(outputDir, frameName), frameBuffer);
-      } catch (err) {
-        console.warn('Screenshot loop frame ' + frameCounter + ' failed: ' + String((err && err.message) || err));
-      }
+      } catch (err) {}
       var elapsed = Date.now() - loopStart;
-      var waitMs = Math.max(0, 100 - elapsed);
-      await sleep(waitMs);
+      await sleep(Math.max(0, 100 - elapsed));
     }
   })();
 
@@ -202,9 +156,7 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
       var entry = timeline[i];
       var targetElapsedMs = Math.max(0, entry.start * 1000);
       var actualElapsedMs = Date.now() - startedAt;
-      if (targetElapsedMs > actualElapsedMs) {
-        await sleep(targetElapsedMs - actualElapsedMs);
-      }
+      if (targetElapsedMs > actualElapsedMs) await sleep(targetElapsedMs - actualElapsedMs);
 
       switch (entry.action) {
         case 'Open':
@@ -228,21 +180,10 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
             if (clResult.found) await drawHighlightBox(page, clResult.rect);
           }
           break;
-        case 'Wait':
-          break;
-        case 'Close':
-          break;
-        default:
-          console.warn('Unknown action "' + entry.action + '" for sceneId ' + entry.sceneId + ' - skipping.');
       }
-
       var holdUntilMs = Math.max(0, entry.end * 1000);
-      var elapsedNow = Date.now() - startedAt;
-      if (holdUntilMs > elapsedNow) {
-        await sleep(holdUntilMs - elapsedNow);
-      }
+      if (holdUntilMs > (Date.now() - startedAt)) await sleep(holdUntilMs - (Date.now() - startedAt));
     }
-
     var tailMs = Math.max(0, totalDurationSeconds * 1000 - (Date.now() - startedAt));
     if (tailMs > 0) await sleep(tailMs);
   } finally {
@@ -252,33 +193,20 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
     await context.close();
     await browser.close();
   }
-
   return { outputDir: outputDir, frameCount: frameCounter };
 }
 
 function framesToMp4(outputDir, mp4Path) {
   return new Promise(function(resolve, reject) {
     var ffmpeg = spawn('ffmpeg', [
-      '-y',
-      '-framerate', '10',
-      '-i', path.join(outputDir, 'frame-%06d.jpg'),
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '23',
-      '-pix_fmt', 'yuv420p',
-      '-vf', 'scale=720:1280,fps=30',
-      mp4Path
+      '-y', '-framerate', '10', '-i', path.join(outputDir, 'frame-%06d.jpg'),
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p', '-vf', 'scale=720:1280,fps=30', mp4Path
     ]);
-
     var stderr = '';
     ffmpeg.stderr.on('data', function(d) { stderr += d.toString(); });
-    ffmpeg.on('error', function(err) { reject(new Error('Failed to start ffmpeg: ' + err.message)); });
     ffmpeg.on('close', function(code) {
-      if (code === 0 && fs.existsSync(mp4Path)) {
-        resolve(mp4Path);
-      } else {
-        reject(new Error('ffmpeg exited with code ' + code + '. stderr: ' + stderr.slice(-1000)));
-      }
+      if (code === 0 && fs.existsSync(mp4Path)) resolve(mp4Path);
+      else reject(new Error('ffmpeg failed code ' + code + ': ' + stderr.slice(-500)));
     });
   });
 }
@@ -288,28 +216,32 @@ app.get('/health', function(req, res) {
 });
 
 app.post('/record', async function(req, res) {
-  if (!WORKER_SECRET) {
-    return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
+  if (!WORKER_SECRET || req.get('x-worker-secret') !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
-  var providedSecret = req.get('x-worker-secret') || '';
-  if (providedSecret !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized - missing or incorrect X-Worker-Secret header.' });
-  }
-
   var body = req.body || {};
-  var schemaVersion = body.schemaVersion;
-  var officialUrl = body.officialUrl;
-  var totalDurationSeconds = body.totalDurationSeconds;
-  var timeline = body.timeline;
+  if (!body.officialUrl || !Array.isArray(body.timeline)) {
+    return res.status(400).json({ error: 'Invalid payload' });
+  }
+  var duration = Number(body.totalDurationSeconds) || body.timeline[body.timeline.length - 1].end || 30;
+  var outputDir = path.join(os.tmpdir(), 'amin-recording-' + crypto.randomUUID());
+  fs.mkdirSync(outputDir, { recursive: true });
+  var mp4Path = path.join(outputDir, 'recording.mp4');
 
-  if (!schemaVersion || typeof schemaVersion !== 'string') {
-    return res.status(400).json({ error: 'Missing or invalid "schemaVersion" field.' });
+  try {
+    await runTimeline(body.officialUrl, body.timeline, duration, outputDir);
+    await framesToMp4(outputDir, mp4Path);
+    var videoBuffer = fs.readFileSync(mp4Path);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', 'attachment; filename="recording.mp4"');
+    res.send(videoBuffer);
+  } catch (err) {
+    res.status(500).json({ error: 'Recording failed', detail: String(err.message || err) });
+  } finally {
+    fs.rm(outputDir, { recursive: true, force: true }, function() {});
   }
-  var majorVersion = schemaVersion.split('.')[0];
-  if (majorVersion !== SUPPORTED_MAJOR_VERSION) {
-    return res.status(409).json({
-      error: 'Unsupported contract version "' + schemaVersion + '". This worker only supports major version ' + SUPPORTED_MAJOR_VERSION + '.x.'
-    });
-  }
-  if (!officialUrl || typeof officialUrl !== 'string') {
-    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' 
+});
+
+app.listen(PORT, function() {
+  console.log('Worker listening on port ' + PORT);
+});
