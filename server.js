@@ -152,7 +152,7 @@ async function tryHideCookieBanner(page) {
       return true;
     });
   } catch (e) {
-    // No banner present, or hide failed -- ignore.
+    // No banner present -- ignore.
   }
 }
 
@@ -172,12 +172,30 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
     ]
   });
   var context = await browser.newContext({
-    viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT },
-    recordVideo: { dir: outputDir, size: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } }
+    viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT }
   });
   var page = await context.newPage();
 
   var startedAt = Date.now();
+
+  var frameCounter = 0;
+  var capturing = true;
+  var captureLoopPromise = (async function() {
+    while (capturing) {
+      var loopStart = Date.now();
+      try {
+        frameCounter += 1;
+        var frameName = 'frame-' + String(frameCounter).padStart(6, '0') + '.jpg';
+        var frameBuffer = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
+        fs.writeFileSync(path.join(outputDir, frameName), frameBuffer);
+      } catch (err) {
+        console.warn('Screenshot loop frame ' + frameCounter + ' failed: ' + String((err && err.message) || err));
+      }
+      var elapsed = Date.now() - loopStart;
+      var waitMs = Math.max(0, 100 - elapsed);
+      await sleep(waitMs);
+    }
+  })();
 
   try {
     for (var i = 0; i < timeline.length; i++) {
@@ -228,26 +246,27 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
     var tailMs = Math.max(0, totalDurationSeconds * 1000 - (Date.now() - startedAt));
     if (tailMs > 0) await sleep(tailMs);
   } finally {
+    capturing = false;
+    await captureLoopPromise;
     await page.close();
+    await context.close();
+    await browser.close();
   }
 
-  var videoPath = await page.video().path();
-  await context.close();
-  await browser.close();
-
-  return videoPath;
+  return { outputDir: outputDir, frameCount: frameCounter };
 }
 
-function webmToMp4(webmPath) {
+function framesToMp4(outputDir, mp4Path) {
   return new Promise(function(resolve, reject) {
-    var mp4Path = webmPath.replace(/\.webm$/, '.mp4');
     var ffmpeg = spawn('ffmpeg', [
       '-y',
-      '-i', webmPath,
+      '-framerate', '10',
+      '-i', path.join(outputDir, 'frame-%06d.jpg'),
       '-c:v', 'libx264',
       '-preset', 'veryfast',
       '-crf', '23',
       '-pix_fmt', 'yuv420p',
+      '-vf', 'scale=720:1280,fps=30',
       mp4Path
     ]);
 
@@ -293,143 +312,4 @@ app.post('/record', async function(req, res) {
     });
   }
   if (!officialUrl || typeof officialUrl !== 'string') {
-    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' });
-  }
-  if (!Array.isArray(timeline) || timeline.length === 0) {
-    return res.status(400).json({ error: 'Missing or empty "timeline" array.' });
-  }
-  var duration = Number(totalDurationSeconds) || timeline[timeline.length - 1].end || 30;
-  if (duration > MAX_TOTAL_DURATION_SECONDS) {
-    return res.status(400).json({ error: 'totalDurationSeconds (' + duration + ') exceeds the ' + MAX_TOTAL_DURATION_SECONDS + 's safety ceiling.' });
-  }
-
-  var outputDir = path.join(os.tmpdir(), 'amin-recording-' + crypto.randomUUID());
-  fs.mkdirSync(outputDir, { recursive: true });
-
-  try {
-    var webmPath = await runTimeline(officialUrl, timeline, duration, outputDir);
-    var mp4Path = await webmToMp4(webmPath);
-    var videoBuffer = fs.readFileSync(mp4Path);
-
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', 'attachment; filename="recording.mp4"');
-    res.send(videoBuffer);
-  } catch (err) {
-    console.error('Recording failed:', err);
-    res.status(500).json({ error: 'Recording failed', detail: String((err && err.message) || err) });
-  } finally {
-    fs.rm(outputDir, { recursive: true, force: true }, function() {});
-  }
-});
-
-app.post('/debug-screenshot', async function(req, res) {
-  if (!WORKER_SECRET) {
-    return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
-  }
-  var providedSecret = req.get('x-worker-secret') || '';
-  if (providedSecret !== WORKER_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized - missing or incorrect X-Worker-Secret header.' });
-  }
-
-  var body = req.body || {};
-  var officialUrl = body.officialUrl;
-  if (!officialUrl || typeof officialUrl !== 'string') {
-    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' });
-  }
-
-  var consoleLogs = [];
-  var pageErrors = [];
-  var requestFailures = [];
-  var browser = null;
-  var timedOut = false;
-
-  var timeoutHandle = setTimeout(function() {
-    timedOut = true;
-  }, DEBUG_SCREENSHOT_TIMEOUT_SECONDS * 1000);
-
-  try {
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--disable-dev-shm-usage',
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-default-apps',
-        '--disable-sync',
-        '--disable-translate',
-        '--no-first-run'
-      ]
-    });
-
-    var context = await browser.newContext({
-      viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT }
-    });
-    var page = await context.newPage();
-
-    page.on('console', function(msg) {
-      consoleLogs.push(msg.type() + ': ' + msg.text());
-    });
-    page.on('pageerror', function(err) {
-      pageErrors.push(String(err));
-    });
-    page.on('requestfailed', function(request) {
-      var failure = request.failure();
-      requestFailures.push(request.url() + ' -> ' + (failure ? failure.errorText : 'unknown error'));
-    });
-
-    var navError = null;
-    try {
-      await page.goto(officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    } catch (err) {
-      navError = String((err && err.message) || err);
-    }
-
-    if (timedOut) {
-      throw new Error('Debug screenshot exceeded ' + DEBUG_SCREENSHOT_TIMEOUT_SECONDS + 's timeout before screenshot could be taken.');
-    }
-
-    await page.waitForTimeout(2000);
-
-    var screenshotBuffer = await page.screenshot({ type: 'png' });
-
-    clearTimeout(timeoutHandle);
-
-    res.setHeader('Content-Type', 'application/json');
-    res.json({
-      navigationError: navError,
-      screenshotBase64: screenshotBuffer.toString('base64'),
-      consoleLogs: consoleLogs,
-      pageErrors: pageErrors,
-      requestFailures: requestFailures
-    });
-  } catch (err) {
-    clearTimeout(timeoutHandle);
-    console.error('Debug screenshot failed:', err);
-    res.status(500).json({
-      error: 'Debug screenshot failed',
-      detail: String((err && err.message) || err),
-      consoleLogs: consoleLogs,
-      pageErrors: pageErrors,
-      requestFailures: requestFailures
-    });
-  } finally {
-    if (browser) {
-      try {
-        await browser.close();
-      } catch (closeErr) {
-        console.error('Error closing browser in /debug-screenshot:', closeErr);
-      }
-    }
-  }
-});
-
-app.listen(PORT, function() {
-  console.log('Browser Automation Worker listening on port ' + PORT);
-  console.log('Supports Timeline AI contract major version: ' + SUPPORTED_MAJOR_VERSION + '.x');
-  console.log('Recording resolution: ' + RECORDING_WIDTH + 'x' + RECORDING_HEIGHT);
-  if (!WORKER_SECRET) {
-    console.warn('WARNING: WORKER_SECRET is not set - /record will reject all requests until it is.');
-  }
-});
+    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' 
