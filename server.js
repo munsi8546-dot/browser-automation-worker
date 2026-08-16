@@ -474,6 +474,93 @@ app.post('/debug-screenshot', async function(req, res) {
   }
 });
 
+// --- Diagnostic endpoint (temporary, isolated) ---
+// Runs the EXACT same screenshot-loop capture used by runTimeline() for a
+// short, fixed duration, then returns three actual sample frames (first,
+// middle, last) as base64 PNG in the JSON response so they can be visually
+// inspected directly -- instead of inferring from Railway logs alone.
+// Does not touch /record, /health, /debug-screenshot, runTimeline(),
+// framesToMp4(), or any launch args. Fully separate code path.
+app.post('/debug-loop-frames', async function(req, res) {
+  if (!WORKER_SECRET) {
+    return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
+  }
+  var providedSecret = req.get('x-worker-secret') || '';
+  if (providedSecret !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized - missing or incorrect X-Worker-Secret header.' });
+  }
+
+  var body = req.body || {};
+  var officialUrl = body.officialUrl;
+  var testDurationSeconds = Number(body.testDurationSeconds) || 3;
+  if (!officialUrl || typeof officialUrl !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' });
+  }
+
+  var browser = null;
+  var loopErrors = [];
+  var frames = [];
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-translate',
+        '--no-first-run'
+      ]
+    });
+    var context = await browser.newContext({
+      viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT }
+    });
+    var page = await context.newPage();
+
+    await page.goto(officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await tryHideCookieBanner(page);
+
+    var loopStartedAt = Date.now();
+    while (Date.now() - loopStartedAt < testDurationSeconds * 1000) {
+      var iterStart = Date.now();
+      try {
+        var buf = await page.screenshot({ type: 'png' });
+        frames.push(buf);
+      } catch (err) {
+        loopErrors.push(String((err && err.message) || err));
+      }
+      var elapsed = Date.now() - iterStart;
+      await sleep(Math.max(0, 100 - elapsed));
+    }
+
+    await context.close();
+    await browser.close();
+
+    var sampleIndexes = frames.length === 0 ? [] :
+      Array.from(new Set([0, Math.floor(frames.length / 2), frames.length - 1]));
+
+    var samples = sampleIndexes.map(function(idx) {
+      return { index: idx, base64Png: frames[idx].toString('base64') };
+    });
+
+    res.json({
+      totalFramesCaptured: frames.length,
+      loopErrors: loopErrors,
+      samples: samples
+    });
+  } catch (err) {
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
+    console.error('Debug loop-frames failed:', err);
+    res.status(500).json({ error: 'Debug loop-frames failed', detail: String((err && err.message) || err), loopErrors: loopErrors });
+  }
+});
+
 app.listen(PORT, function() {
   console.log('Browser Automation Worker listening on port ' + PORT);
   console.log('Supports Timeline AI contract major version: ' + SUPPORTED_MAJOR_VERSION + '.x');
