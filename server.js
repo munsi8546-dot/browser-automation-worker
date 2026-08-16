@@ -561,6 +561,105 @@ app.post('/debug-loop-frames', async function(req, res) {
   }
 });
 
+// --- Diagnostic endpoint (temporary, isolated) ---
+// Tests context.recordVideo directly, WITHOUT calling tryHideCookieBanner().
+// Purpose: isolate whether recordVideo itself is broken on this Railway
+// container (still black even with zero DOM manipulation), or whether
+// tryHideCookieBanner()'s page.evaluate() call is what corrupts the
+// recording. Records a short fixed-duration clip, converts to mp4, and
+// returns it as base64 in the JSON response for direct visual inspection.
+// Does not touch /record, runTimeline(), the screenshot-loop capture, or
+// framesToMp4(). Fully separate code path.
+app.post('/debug-record-test', async function(req, res) {
+  if (!WORKER_SECRET) {
+    return res.status(500).json({ error: 'Worker misconfigured: WORKER_SECRET is not set on the server.' });
+  }
+  var providedSecret = req.get('x-worker-secret') || '';
+  if (providedSecret !== WORKER_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized - missing or incorrect X-Worker-Secret header.' });
+  }
+
+  var body = req.body || {};
+  var officialUrl = body.officialUrl;
+  var testDurationSeconds = Number(body.testDurationSeconds) || 5;
+  if (!officialUrl || typeof officialUrl !== 'string') {
+    return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' });
+  }
+
+  var testDir = path.join(os.tmpdir(), 'amin-record-test-' + crypto.randomUUID());
+  fs.mkdirSync(testDir, { recursive: true });
+  var browser = null;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-translate',
+        '--no-first-run'
+      ]
+    });
+    var context = await browser.newContext({
+      viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT },
+      recordVideo: { dir: testDir, size: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } }
+    });
+    var page = await context.newPage();
+
+    await page.goto(officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    // Deliberately NOT calling tryHideCookieBanner() here -- isolating
+    // recordVideo behavior with zero DOM manipulation after navigation.
+
+    await sleep(testDurationSeconds * 1000);
+
+    await page.close();
+    var videoPath = await page.video().path();
+    await context.close();
+    await browser.close();
+    browser = null;
+
+    var mp4Path = videoPath.replace(/\.webm$/, '.mp4');
+    await new Promise(function(resolve, reject) {
+      var ffmpeg = spawn('ffmpeg', [
+        '-y',
+        '-i', videoPath,
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '23',
+        '-pix_fmt', 'yuv420p',
+        mp4Path
+      ]);
+      var stderr = '';
+      ffmpeg.stderr.on('data', function(d) { stderr += d.toString(); });
+      ffmpeg.on('error', function(err) { reject(new Error('Failed to start ffmpeg: ' + err.message)); });
+      ffmpeg.on('close', function(code) {
+        if (code === 0 && fs.existsSync(mp4Path)) resolve();
+        else reject(new Error('ffmpeg exited with code ' + code + '. stderr: ' + stderr.slice(-1000)));
+      });
+    });
+
+    var mp4Buffer = fs.readFileSync(mp4Path);
+    res.json({
+      testDurationSeconds: testDurationSeconds,
+      mp4SizeBytes: mp4Buffer.length,
+      mp4Base64: mp4Buffer.toString('base64')
+    });
+  } catch (err) {
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
+    console.error('Debug record-test failed:', err);
+    res.status(500).json({ error: 'Debug record-test failed', detail: String((err && err.message) || err) });
+  } finally {
+    fs.rm(testDir, { recursive: true, force: true }, function() {});
+  }
+});
+
 app.listen(PORT, function() {
   console.log('Browser Automation Worker listening on port ' + PORT);
   console.log('Supports Timeline AI contract major version: ' + SUPPORTED_MAJOR_VERSION + '.x');
