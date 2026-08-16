@@ -126,8 +126,42 @@ async function tryClickText(page, targetText) {
   return false;
 }
 
-// --- Cookie banner suppression (Issue A fix, v2) ---
-// v1 clicked the "Accept only necessary cookies" button directly, which
+// --- Cookie banner suppression (Issue A fix, v3 -- diagnostic candidate) ---
+// v2 (tryHideCookieBanner above) still uses page.evaluate() to walk up to 6
+// ancestors calling window.getComputedStyle() at each step, then directly
+// sets style.display on the found container. Confirmed (commit 29f1ccb3)
+// that this STILL produced a 100% black recordVideo output, even though it
+// never clicks or navigates. v3 minimizes what evaluate() does: it only
+// marks the container with a data-attribute (one cheap DOM write, no
+// getComputedStyle loop), then hides it via page.addStyleTag() -- a
+// separate Playwright-level CSS injection call, not further JS evaluation.
+// This isolates whether the getComputedStyle-walking loop itself was the
+// problem, or whether any evaluate()-based mutation breaks the recording.
+async function tryHideCookieBannerV3(page) {
+  try {
+    var marked = await page.evaluate(function() {
+      var targetPhrase = 'accept only necessary cookies';
+      var candidates = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+      var match = candidates.find(function(el) {
+        var text = (el.innerText || el.textContent || el.value || '').trim().toLowerCase();
+        return text.indexOf(targetPhrase) !== -1;
+      });
+      if (!match) return false;
+      var container = match.closest('[class*="cookie"],[class*="consent"],[id*="cookie"],[id*="consent"],[class*="matomo"],[id*="matomo"]') || match.parentElement || match;
+      container.setAttribute('data-amin-cookie-banner', 'true');
+      return true;
+    });
+
+    if (marked) {
+      await page.addStyleTag({ content: '[data-amin-cookie-banner="true"] { display: none !important; }' });
+    }
+  } catch (e) {
+    // No banner present, or marking/hiding failed for an unrelated reason --
+    // ignore and continue. Never let this break /record.
+  }
+}
+
+// v2 (kept for now, currently unused by runTimeline -- still under test)
 // caused the recorded video to go 100% black (confirmed via /debug-screenshot
 // + Railway logs: page renders fine with no click; recording pipeline threw
 // no errors yet produced black frames the moment the click was added --
@@ -582,6 +616,7 @@ app.post('/debug-record-test', async function(req, res) {
   var body = req.body || {};
   var officialUrl = body.officialUrl;
   var testDurationSeconds = Number(body.testDurationSeconds) || 5;
+  var testCookieHide = body.testCookieHide === true;
   if (!officialUrl || typeof officialUrl !== 'string') {
     return res.status(400).json({ error: 'Missing or invalid "officialUrl" field.' });
   }
@@ -612,8 +647,13 @@ app.post('/debug-record-test', async function(req, res) {
     var page = await context.newPage();
 
     await page.goto(officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    // Deliberately NOT calling tryHideCookieBanner() here -- isolating
-    // recordVideo behavior with zero DOM manipulation after navigation.
+    // Only calls the v3 cookie-hide (addStyleTag-based) function when
+    // testCookieHide=true, so the same endpoint can run the baseline
+    // (no DOM manipulation) and the cookie-hide variant as two separate,
+    // controlled tests.
+    if (testCookieHide) {
+      await tryHideCookieBannerV3(page);
+    }
 
     await sleep(testDurationSeconds * 1000);
 
@@ -646,6 +686,7 @@ app.post('/debug-record-test', async function(req, res) {
     var mp4Buffer = fs.readFileSync(mp4Path);
     res.json({
       testDurationSeconds: testDurationSeconds,
+      testCookieHide: testCookieHide,
       mp4SizeBytes: mp4Buffer.length,
       mp4Base64: mp4Buffer.toString('base64')
     });
