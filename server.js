@@ -231,38 +231,12 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
     ]
   });
   var context = await browser.newContext({
-    viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT }
+    viewport: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT },
+    recordVideo: { dir: outputDir, size: { width: RECORDING_WIDTH, height: RECORDING_HEIGHT } }
   });
   var page = await context.newPage();
 
   var startedAt = Date.now();
-
-  // --- Screenshot-loop capture (replaces context.recordVideo) ---
-  // recordVideo produced clean, non-erroring but 100% black output on
-  // Railway's containers -- a known headless-Chromium/compositor issue.
-  // page.screenshot() goes through a different code path and does not
-  // depend on the video/compositor pipeline, so it sidesteps that failure
-  // mode entirely.
-  var frameCounter = 0;
-  var capturing = true;
-  var captureLoopPromise = (async function() {
-    while (capturing) {
-      var loopStart = Date.now();
-      try {
-        frameCounter += 1;
-        var frameName = 'frame-' + String(frameCounter).padStart(6, '0') + '.jpg';
-        var frameBuffer = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
-        fs.writeFileSync(path.join(outputDir, frameName), frameBuffer);
-      } catch (err) {
-        // Page may be mid-navigation or briefly unavailable -- log and keep
-        // going. A missed frame or two must never stop the loop or /record.
-        console.warn('Screenshot loop frame ' + frameCounter + ' failed: ' + String((err && err.message) || err));
-      }
-      var elapsed = Date.now() - loopStart;
-      var waitMs = Math.max(0, 100 - elapsed);
-      await sleep(waitMs);
-    }
-  })();
 
   try {
     for (var i = 0; i < timeline.length; i++) {
@@ -276,7 +250,7 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
       switch (entry.action) {
         case 'Open':
           await page.goto(entry.officialUrl || officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await tryHideCookieBanner(page);
+          await tryHideCookieBannerV3(page);
           break;
         case 'Scroll':
           await clearHighlightBoxes(page);
@@ -313,27 +287,26 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
     var tailMs = Math.max(0, totalDurationSeconds * 1000 - (Date.now() - startedAt));
     if (tailMs > 0) await sleep(tailMs);
   } finally {
-    capturing = false;
-    await captureLoopPromise;
     await page.close();
-    await context.close();
-    await browser.close();
   }
 
-  return { outputDir: outputDir, frameCount: frameCounter };
+  var videoPath = await page.video().path();
+  await context.close();
+  await browser.close();
+
+  return videoPath;
 }
 
-function framesToMp4(outputDir, mp4Path) {
+function webmToMp4(webmPath) {
   return new Promise(function(resolve, reject) {
+    var mp4Path = webmPath.replace(/\.webm$/, '.mp4');
     var ffmpeg = spawn('ffmpeg', [
       '-y',
-      '-framerate', '10',
-      '-i', path.join(outputDir, 'frame-%06d.jpg'),
+      '-i', webmPath,
       '-c:v', 'libx264',
       '-preset', 'veryfast',
       '-crf', '23',
       '-pix_fmt', 'yuv420p',
-      '-vf', 'scale=720:1280,fps=30',
       mp4Path
     ]);
 
@@ -391,12 +364,10 @@ app.post('/record', async function(req, res) {
 
   var outputDir = path.join(os.tmpdir(), 'amin-recording-' + crypto.randomUUID());
   fs.mkdirSync(outputDir, { recursive: true });
-  var mp4Path = path.join(outputDir, 'recording.mp4');
 
   try {
-    var captureResult = await runTimeline(officialUrl, timeline, duration, outputDir);
-    console.log('Screenshot loop captured ' + captureResult.frameCount + ' frames.');
-    await framesToMp4(outputDir, mp4Path);
+    var webmPath = await runTimeline(officialUrl, timeline, duration, outputDir);
+    var mp4Path = await webmToMp4(webmPath);
     var videoBuffer = fs.readFileSync(mp4Path);
 
     res.setHeader('Content-Type', 'video/mp4');
