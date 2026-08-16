@@ -147,7 +147,20 @@ async function tryHideCookieBannerV3(page) {
         return text.indexOf(targetPhrase) !== -1;
       });
       if (!match) return false;
-      var container = match.closest('[class*="cookie"],[class*="consent"],[id*="cookie"],[id*="consent"],[class*="matomo"],[id*="matomo"]') || match.parentElement || match;
+
+      // Walk up to the nearest fixed/sticky-positioned ancestor -- that's
+      // reliably the full banner box, not just a wrapper around one button.
+      var container = match;
+      var el = match;
+      for (var i = 0; i < 6 && el; i++) {
+        var style = window.getComputedStyle(el);
+        if (style.position === 'fixed' || style.position === 'sticky') {
+          container = el;
+          break;
+        }
+        el = el.parentElement;
+        if (el) container = el;
+      }
       container.setAttribute('data-amin-cookie-banner', 'true');
       return true;
     });
