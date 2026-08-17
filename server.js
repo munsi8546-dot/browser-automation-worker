@@ -15,8 +15,8 @@ const PORT = process.env.PORT || 8080;
 const WORKER_SECRET = process.env.WORKER_SECRET || '';
 const SUPPORTED_MAJOR_VERSION = '1';
 
-const RECORDING_WIDTH = 720;
-const RECORDING_HEIGHT = 1280;
+const RECORDING_WIDTH = 1920;
+const RECORDING_HEIGHT = 1080;
 
 const MAX_TOTAL_DURATION_SECONDS = 180;
 const DEBUG_SCREENSHOT_TIMEOUT_SECONDS = 45;
@@ -124,6 +124,50 @@ async function tryClickText(page, targetText) {
     }
   }
   return false;
+}
+
+// --- Zoom-pan camera effect (professional/documentary feel) ---
+// Applies a CSS transform (scale + translate) to document.body so the
+// highlighted element appears to be smoothly zoomed into, like a camera
+// push-in. Because /record uses Playwright's native context.recordVideo
+// (real-time compositor capture, not a screenshot loop), this transition
+// is captured live in the output video for free -- no extra frame handling
+// needed. zoomOut() reverses it. Both are no-ops-safe: if called when
+// already in the target state they just re-apply the same transform.
+async function zoomToRect(page, rect, opts) {
+  if (!rect) return;
+  var scale = (opts && opts.scale) || 1.6;
+  var durationMs = (opts && opts.durationMs) || 1200;
+
+  await page.evaluate(function(args) {
+    var r = args.rect;
+    var scale = args.scale;
+    var durationMs = args.durationMs;
+
+    var cx = r.x + r.width / 2;
+    var cy = r.y + r.height / 2;
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    var tx = (vw / 2 - cx) * scale;
+    var ty = (vh / 2 - cy) * scale;
+
+    document.body.style.transition = 'transform ' + durationMs + 'ms ease-in-out';
+    document.body.style.transformOrigin = 'center center';
+    document.body.style.transform = 'translate(' + tx + 'px, ' + ty + 'px) scale(' + scale + ')';
+  }, { rect: rect, scale: scale, durationMs: durationMs });
+
+  await sleep(durationMs);
+}
+
+async function zoomOut(page, opts) {
+  var durationMs = (opts && opts.durationMs) || 1000;
+
+  await page.evaluate(function(durationMs) {
+    document.body.style.transition = 'transform ' + durationMs + 'ms ease-in-out';
+    document.body.style.transform = 'translate(0px, 0px) scale(1)';
+  }, durationMs);
+
+  await sleep(durationMs);
 }
 
 // --- Cookie banner suppression (Issue A fix, v3 -- diagnostic candidate) ---
@@ -237,6 +281,10 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
   var page = await context.newPage();
 
   var startedAt = Date.now();
+  // Tracks whether the page is currently zoomed in on a Highlight target,
+  // so any subsequent non-Highlight action (or the end of the timeline)
+  // smoothly zooms back out first instead of jumping/cutting.
+  var isZoomedIn = false;
 
   try {
     for (var i = 0; i < timeline.length; i++) {
@@ -249,19 +297,27 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
 
       switch (entry.action) {
         case 'Open':
+          if (isZoomedIn) { await zoomOut(page); isZoomedIn = false; }
           await page.goto(entry.officialUrl || officialUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
           await tryHideCookieBannerV3(page);
           break;
         case 'Scroll':
+          if (isZoomedIn) { await zoomOut(page); isZoomedIn = false; }
           await clearHighlightBoxes(page);
           await findAndScrollToText(page, entry.target);
           break;
         case 'Highlight':
+          if (isZoomedIn) { await zoomOut(page); isZoomedIn = false; }
           await clearHighlightBoxes(page);
           var hlResult = await findAndScrollToText(page, entry.target);
-          if (hlResult.found) await drawHighlightBox(page, hlResult.rect);
+          if (hlResult.found) {
+            await drawHighlightBox(page, hlResult.rect);
+            await zoomToRect(page, hlResult.rect, { scale: 1.6, durationMs: 1200 });
+            isZoomedIn = true;
+          }
           break;
         case 'Click':
+          if (isZoomedIn) { await zoomOut(page); isZoomedIn = false; }
           await clearHighlightBoxes(page);
           var didClick = await tryClickText(page, entry.target);
           if (!didClick) {
@@ -272,6 +328,7 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
         case 'Wait':
           break;
         case 'Close':
+          if (isZoomedIn) { await zoomOut(page); isZoomedIn = false; }
           break;
         default:
           console.warn('Unknown action "' + entry.action + '" for sceneId ' + entry.sceneId + ' - skipping.');
@@ -282,6 +339,13 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
       if (holdUntilMs > elapsedNow) {
         await sleep(holdUntilMs - elapsedNow);
       }
+    }
+
+    // Never end the recording mid-zoom -- if the last scene was a Highlight,
+    // return to full page view before the tail hold.
+    if (isZoomedIn) {
+      await zoomOut(page);
+      isZoomedIn = false;
     }
 
     var tailMs = Math.max(0, totalDurationSeconds * 1000 - (Date.now() - startedAt));
@@ -303,6 +367,7 @@ function webmToMp4(webmPath) {
     var ffmpeg = spawn('ffmpeg', [
       '-y',
       '-i', webmPath,
+      '-vf', 'scale=' + RECORDING_WIDTH + ':' + RECORDING_HEIGHT + ',fps=30',
       '-c:v', 'libx264',
       '-preset', 'veryfast',
       '-crf', '23',
