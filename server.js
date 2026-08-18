@@ -170,6 +170,49 @@ async function zoomOut(page, opts) {
   await sleep(durationMs);
 }
 
+// --- Ken Burns-style continuous drift during a Highlight hold ---
+// Previously, after zoomToRect() pushed in, the view sat perfectly still
+// for the rest of the Highlight action's on-screen time (a static hold).
+// This makes the frame keep slowly moving for that entire remaining
+// duration instead -- a gentle continued push/pan, like a documentary
+// camera that never fully stops -- so the visual stays alive while the
+// narrator is talking about the highlighted content. Call this AFTER
+// zoomToRect(), passing however much time is left before the timeline
+// wants to move on (holdMs). Uses one long CSS transition (linear, so the
+// drift speed is constant and doesn't jerk), so like zoomToRect() it's
+// captured live by Playwright's recordVideo for free.
+async function panDuringHold(page, rect, holdMs) {
+  if (!rect || holdMs <= 0) return;
+
+  await page.evaluate(function(args) {
+    var r = args.rect;
+    var holdMs = args.holdMs;
+    var scale = 1.6;
+
+    var cx = r.x + r.width / 2;
+    var cy = r.y + r.height / 2;
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+
+    // Drift a little further in and slightly toward whichever side has
+    // more room, so it reads as a natural continued push rather than a
+    // random shake. Kept subtle (small px/scale deltas) since this plays
+    // out over several seconds, not a snap-cut.
+    var driftX = (cx < vw / 2) ? -22 : 22;
+    var driftY = -10;
+    var endScale = scale + 0.1;
+
+    var tx = (vw / 2 - cx) * scale + driftX;
+    var ty = (vh / 2 - cy) * scale + driftY;
+
+    document.body.style.transition = 'transform ' + holdMs + 'ms linear';
+    document.body.style.transformOrigin = 'center center';
+    document.body.style.transform = 'translate(' + tx + 'px, ' + ty + 'px) scale(' + endScale + ')';
+  }, { rect: rect, holdMs: holdMs });
+
+  await sleep(holdMs);
+}
+
 // --- Cookie banner suppression (Issue A fix, v3 -- diagnostic candidate) ---
 // v2 (tryHideCookieBanner above) still uses page.evaluate() to walk up to 6
 // ancestors calling window.getComputedStyle() at each step, then directly
@@ -314,6 +357,18 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
             await drawHighlightBox(page, hlResult.rect);
             await zoomToRect(page, hlResult.rect, { scale: 1.6, durationMs: 1200 });
             isZoomedIn = true;
+
+            // Instead of holding perfectly still for the rest of this
+            // action's on-screen time, keep the camera slowly drifting
+            // (Ken Burns style) for whatever time remains until entry.end
+            // -- so the frame stays visually alive while the narration
+            // talks about this content, in sync with its actual duration.
+            var holdUntilMsForPan = Math.max(0, entry.end * 1000);
+            var elapsedNowForPan = Date.now() - startedAt;
+            var remainingHoldMsForPan = holdUntilMsForPan - elapsedNowForPan;
+            if (remainingHoldMsForPan > 300) {
+              await panDuringHold(page, hlResult.rect, remainingHoldMsForPan);
+            }
           }
           break;
         case 'Click':
