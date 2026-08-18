@@ -347,7 +347,23 @@ async function runTimeline(officialUrl, timeline, totalDurationSeconds, outputDi
         case 'Scroll':
           if (isZoomedIn) { await zoomOut(page); isZoomedIn = false; }
           await clearHighlightBoxes(page);
-          await findAndScrollToText(page, entry.target);
+          var scResult = await findAndScrollToText(page, entry.target);
+          if (scResult.found) {
+            // Same idea as Highlight, but gentler (no yellow box, smaller
+            // zoom) since Scroll scenes are the majority of most timelines
+            // -- without this, the camera sat perfectly still for nearly
+            // the whole video since only the final scene is ever marked
+            // as Highlight.
+            await zoomToRect(page, scResult.rect, { scale: 1.3, durationMs: 900 });
+            isZoomedIn = true;
+
+            var holdUntilMsForScrollPan = Math.max(0, entry.end * 1000);
+            var elapsedNowForScrollPan = Date.now() - startedAt;
+            var remainingHoldMsForScrollPan = holdUntilMsForScrollPan - elapsedNowForScrollPan;
+            if (remainingHoldMsForScrollPan > 300) {
+              await panDuringHold(page, scResult.rect, remainingHoldMsForScrollPan);
+            }
+          }
           break;
         case 'Highlight':
           if (isZoomedIn) { await zoomOut(page); isZoomedIn = false; }
