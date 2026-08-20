@@ -14,16 +14,10 @@
  * + health check, mounting the /record route, and calling app.listen()
  * on Railway's PORT.
  *
- * NOTE: this restores the /record logic from your pasted file as-is
- * (real Playwright navigation + scroll/click/highlight timing, native
- * video recording, ffmpeg webm->mp4 conversion). It does NOT include the
- * later zoom-in/zoom-out camera effect or the tryHideCookieBannerV3 fix
- * you added in a previous session — those aren't in the file you pasted,
- * so I can't reconstruct their exact code. If you still want them, paste
- * that version of the file (or tell me and I'll re-add the cookie-banner
- * V3 fix using the description we have on record) and I'll merge it in.
- * For now, this gets the server actually running again so we can confirm
- * the pipeline end-to-end, then layer those improvements back on.
+ * Also adds tryHideCookieBanner(): dismisses cookie/consent overlays
+ * right after navigation, since a fixed-position banner sitting on top
+ * of the page absorbs scroll events, making the video look "stuck" /
+ * like a zoomed screenshot even though real scroll calls are running.
  * -----------------------------------------------------------------------
  */
 
@@ -84,6 +78,67 @@ async function findTarget(page, target) {
 
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Dismisses cookie/consent banners so they don't sit on top of the whole
+ * recording and swallow scroll/click events (a fixed-position overlay
+ * intercepts page.mouse.wheel(), which makes the underlying page look
+ * "stuck" - like a static screenshot - even though scroll calls are
+ * running fine).
+ *
+ * Two strategies, tried in order:
+ *  1. Click a visible "accept" style button by its text.
+ *  2. Mark likely banner containers via a MINIMAL evaluate() (attribute
+ *     only, no style writes), then hide them with a separate
+ *     addStyleTag() CSS rule. Writing styles directly inside evaluate()
+ *     has previously corrupted Playwright's recordVideo capture, so
+ *     style changes always go through addStyleTag instead.
+ */
+async function tryHideCookieBanner(page) {
+  const acceptPatterns = [
+    /accept only necessary/i,
+    /accept all/i,
+    /accept analytics/i,
+    /^accept$/i,
+    /^agree$/i,
+    /got it/i,
+    /^ok$/i,
+    /^allow all/i,
+  ];
+
+  for (const pattern of acceptPatterns) {
+    try {
+      const btn = page.getByRole('button', { name: pattern }).first();
+      if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+        await btn.click({ timeout: 2000 });
+        await page.waitForTimeout(400);
+        return;
+      }
+    } catch (_) {
+      // try next pattern
+    }
+  }
+
+  try {
+    await page.evaluate(() => {
+      const selectors = [
+        '[class*="cookie" i]', '[id*="cookie" i]',
+        '[class*="consent" i]', '[id*="consent" i]',
+        '[role="dialog"]',
+      ];
+      document.querySelectorAll(selectors.join(',')).forEach((el) => {
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        if ((style.position === 'fixed' || style.position === 'sticky') && rect.height > 40) {
+          el.setAttribute('data-worker-hide-banner', 'true');
+        }
+      });
+    });
+    await page.addStyleTag({ content: '[data-worker-hide-banner="true"] { display: none !important; }' });
+  } catch (_) {
+    // best-effort - if this fails, recording continues without it
+  }
 }
 
 async function highlightElement(page, locator, ms) {
@@ -249,6 +304,8 @@ app.post('/record', requireWorkerSecret, async (req, res) => {
       console.warn('Navigation warning:', err.message);
     });
     const navElapsed = Date.now() - navStart;
+
+    await tryHideCookieBanner(page);
 
     for (let i = 0; i < timeline.length; i++) {
       const scene = timeline[i];
